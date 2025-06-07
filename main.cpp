@@ -15,7 +15,6 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <limits>
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
@@ -26,6 +25,8 @@
 #include <omp.h>
 #include <queue>
 #include <tuple>
+#include <stack>
+#include <cctype>
 #include "EDNAFULL.h"
 #include "EBLOSUM62.h"
 
@@ -461,6 +462,137 @@ std::vector<std::string> msa_star(const std::vector<std::string> &hdrs,
     return aligned;
 }
 
+// a tiny binary tree node for your guide‐tree
+struct Node {
+    bool              leaf;
+    int               seq_index;   // which original sequence, if leaf
+    std::vector<std::string> profile; // current MSA block under this node
+    Node             *left=nullptr, *right=nullptr;
+};
+
+/**
+ * @brief Parses a Newick format string into a binary tree of Nodes.
+ * This version is more robust and correctly handles names, delimiters, and branch lengths.
+ */
+Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names) {
+    auto find_name_index = [&](const std::string& name) {
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == name) {
+                return static_cast<int>(i);
+            }
+        }
+        // This is a critical failure point. A name from the tree was not in the input file list.
+        std::cerr << "\nFATAL PARSING ERROR: The name '" << name
+                  << "' from the guide tree was not found in the list of input sequence headers." << std::endl;
+        return -1;
+    };
+
+    std::stack<Node*> node_stack;
+    Node* root = nullptr;
+    std::string current_text;
+
+    for (size_t i = 0; i < nwk.length(); ++i) {
+        char c = nwk[i];
+
+        if (isspace(c)) continue; // Ignore whitespace
+
+        // Check for delimiters that end a text block (a name)
+        if (c == ',' || c == ')' || c == ':' || c == ';') {
+            if (!current_text.empty()) {
+                if (node_stack.empty()) { // Case for a single-node tree like "A;"
+                     root = new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
+                } else {
+                    Node* parent = node_stack.top();
+                    Node* leaf = new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
+                    if (parent->left == nullptr) parent->left = leaf;
+                    else parent->right = leaf;
+                }
+                current_text.clear();
+            }
+
+            if (c == ')') {
+                if (!node_stack.empty()) node_stack.pop();
+            } else if (c == ':') {
+                // Skip over the branch length that follows the colon
+                while (i + 1 < nwk.length() && (isdigit(nwk[i + 1]) || nwk[i + 1] == '.' || nwk[i + 1] == 'e' || nwk[i + 1] == '-')) {
+                    i++;
+                }
+            }
+        } else if (c == '(') {
+            Node* new_node = new Node{false, -1, {}, nullptr, nullptr};
+            if (root == nullptr) {
+                root = new_node;
+            }
+            if (!node_stack.empty()) {
+                Node* parent = node_stack.top();
+                if (parent->left == nullptr) parent->left = new_node;
+                else parent->right = new_node;
+            }
+            node_stack.push(new_node);
+        } else {
+            // It's a regular character, part of a name
+            current_text += c;
+        }
+    }
+    return root;
+}
+
+/**
+ * @brief Recursively builds a multiple sequence alignment by walking the guide tree.
+ * * This corrected version handles leaf nodes, unary nodes (one child), and binary
+ * nodes (two children) to prevent segmentation faults.
+ */
+std::vector<std::string>
+build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
+    // Safety check for null pointers passed from parent nodes
+    if (!n) {
+        return {};
+    }
+
+    // Case 1: The node is a leaf. Its profile (a single sequence)
+    // was already seeded in the main() function. Just return it.
+    if (n->leaf) {
+        return n->profile;
+    }
+
+    // Recursively build the profiles for the children.
+    auto A = build_profile(n->left,  mode, fn);
+    auto B = build_profile(n->right, mode, fn);
+
+    // Case 2: The node is "unary" (has only one child profile).
+    // No alignment is needed. The profile is just the child's profile.
+    if (A.empty()) {
+        n->profile = B;
+        return n->profile;
+    }
+    if (B.empty()) {
+        n->profile = A;
+        return n->profile;
+    }
+
+    // Case 3: The node is binary. Align the two child profiles (A and B).
+    // Pick a "representative" string from each profile to align.
+    std::string consA = A[0];
+    std::string consB = B[0];
+
+    // Align the representative strings.
+    std::string aligned_consA, aligned_consB;
+    computeGlobalAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB);
+
+    // Project the gaps from the alignment into ALL sequences of each profile.
+    projectGaps(consA, aligned_consA, A);
+    projectGaps(consB, aligned_consB, B);
+
+    // Merge the two aligned profiles into a single new profile.
+    std::vector<std::string> M;
+    M.reserve(A.size() + B.size());
+    M.insert(M.end(), A.begin(), A.end());
+    M.insert(M.end(), B.begin(), B.end());
+
+    n->profile = std::move(M);
+    return n->profile;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
@@ -469,14 +601,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // defaults
+    // 1) Parse flags
     ScoreMode mode = MODE_DNA;
     ScoreFn   fn   = edna_score;
-    // GAP_OPEN and GAP_EXTEND are globals, defaulted above
-
     int argi = 1;
-    // parse all leading “--” options
-    while (argi < argc && std::string(argv[argi]).rfind("--", 0) == 0) {
+    while (argi < argc && std::string(argv[argi]).rfind("--",0) == 0) {
         std::string opt = argv[argi++];
         if (opt == "--mode") {
             if (argi >= argc) {
@@ -484,8 +613,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::string m = argv[argi++];
-            if (m == "dna")       { mode = MODE_DNA;     fn = edna_score; }
-            else if (m == "protein") { mode = MODE_PROTEIN; fn = blosum62_score; }
+            if      (m=="dna")     { mode = MODE_DNA;     fn = edna_score;   }
+            else if (m=="protein") { mode = MODE_PROTEIN; fn = blosum62_score; }
             else {
                 std::cerr<<"Error: unknown mode '"<<m<<"'. Use dna or protein.\n";
                 return 1;
@@ -506,13 +635,13 @@ int main(int argc, char** argv) {
             GAP_EXTEND = std::stod(argv[argi++]);
         }
         else {
-            // not one of our flags → back up and break
+            // unrecognized flag: step back and break
             --argi;
             break;
         }
     }
 
-    // next argument must be outdir
+    // 2) Next arg is outdir
     if (argi >= argc) {
         std::cerr<<"Error: missing outdir.\n";
         return 1;
@@ -520,7 +649,7 @@ int main(int argc, char** argv) {
     std::string outdir = argv[argi++];
     std::filesystem::create_directories(outdir);
 
-    // remaining args are FASTA files
+    // 3) Remaining args are FASTA files
     if (argi >= argc) {
         std::cerr<<"Error: need at least one FASTA file.\n";
         return 1;
@@ -537,77 +666,91 @@ int main(int argc, char** argv) {
         processFasta(files[i], hdrs[i], seqs[i]);
     }
 
+    // 5) Simplify headers
     for (int i = 0; i < n; ++i) {
         if (mode == MODE_PROTEIN) {
-            // protein: header looks like "sp|P01308|INS_HUMAN …"
             auto &h = hdrs[i];
             size_t p1 = h.find('|');
-            size_t p2 = (p1 == std::string::npos)
-                        ? std::string::npos
-                        : h.find('|', p1 + 1);
-            if (p1 != std::string::npos && p2 != std::string::npos) {
-                hdrs[i] = h.substr(p1 + 1, p2 - p1 - 1);
-            }
-        }
-        else {
-            // DNA: just take up to first whitespace
+            size_t p2 = (p1==std::string::npos ? std::string::npos : h.find('|',p1+1));
+            if (p1!=std::string::npos && p2!=std::string::npos)
+                hdrs[i] = h.substr(p1+1, p2-p1-1);
+        } else {
             auto &h = hdrs[i];
-            size_t pos = h.find_first_of(" \t");
-            if (pos != std::string::npos) {
-                hdrs[i] = h.substr(0, pos);
-            }
+            size_t sp = h.find_first_of(" \t");
+            if (sp!=std::string::npos) hdrs[i] = h.substr(0, sp);
         }
     }
 
-    // 5) Compute guide tree (identity distance)
-    auto D = computeDistanceMatrix(seqs, mode, fn);
-    auto tree = buildUPGMATree(D, hdrs);
-    std::ofstream tf(outdir + "/guide_tree.nwk");
-    tf << tree << "\n";
+    // 6) Compute guide tree
+    auto D    = computeDistanceMatrix(seqs, mode, fn);
+    auto nwk  = buildUPGMATree(D, hdrs);
+    std::ofstream tf(outdir+"/guide_tree.nwk");
+    tf << nwk << "\n";
     tf.close();
 
-    // 6) Do star‐alignment MSA
-    auto msa = msa_star(hdrs, seqs, mode, fn);
-    size_t L = 0;
-    for (auto &s : msa) {
-        L = std::max(L, s.size());
-    }
-    // pad shorter ones with gaps:
-    for (auto &s : msa) {
-        if (s.size() < L) {
-            s.append(L - s.size(), '-');
+    // 7) Progressive MSA by walking the UPGMA tree
+    //    build a binary‐tree of Nodes from the Newick
+    Node* root = parseNewick(nwk, hdrs);
+
+    //    seed each leaf with its raw sequence
+    std::queue<Node*> q;
+    if (root) q.push(root); // Push only if the root is valid
+    while (!q.empty()) {
+        Node* u = q.front(); q.pop();
+        if (!u) continue; // Skip if a null pointer somehow got on the queue
+
+        if (u->leaf) {
+            // --- ADDED SAFETY CHECK ---
+            // Verify the index is valid before accessing the 'seqs' vector.
+            if (u->seq_index < 0 || u->seq_index >= seqs.size()) {
+                std::cerr << "\nFATAL LOGIC ERROR: Invalid sequence index " << u->seq_index
+                          << " detected for a leaf node. Cannot retrieve sequence." << std::endl;
+                exit(1); // Exit with an error
+            }
+            u->profile = { seqs[u->seq_index] };
+        } else {
+            // Push children only if they are not null
+            if (u->left) q.push(u->left);
+            if (u->right) q.push(u->right);
         }
     }
 
-    // 7) Print color to stdout
+    //    recursively build the full MSA
+    auto msa = build_profile(root, mode, fn);
+
+    // 8) Pad to uniform length
+    size_t L = 0;
+    for (auto &s : msa) L = std::max(L, s.size());
+    for (auto &s : msa) if (s.size()<L) s.append(L - s.size(), '-');
+
+    // 9) Compute sum‐of‐pairs score
     long long msa_score = 0;
-    int m = msa.size(); L = msa[0].size();
-    for (int j = 0; j < L; ++j) {
+    int m = msa.size();
+    for (size_t j = 0; j < L; ++j) {
         for (int i = 0; i < m; ++i) {
             for (int k = i+1; k < m; ++k) {
                 char a = msa[i][j], b = msa[k][j];
                 if (a!='-' && b!='-')
-                    msa_score += score(a, b, mode);
+                    msa_score += score(a,b,mode);
                 else if ((a=='-') ^ (b=='-'))
-                    msa_score += int(GAP_OPEN);
+                    msa_score += (long long)GAP_OPEN;
             }
         }
     }
-    std::cout << "\nMSA sum-of-pairs score: " << msa_score << "\n\n";
+    std::cout << "\nMSA sum-of-pairs score: " << msa_score << "\n";
+    double avg_col  = double(msa_score)/L;
+    double avg_pair = double(msa_score)/(L * (m*(m-1)/2));
+    std::cout << "avg per column = " << avg_col
+              << ", avg per pair = "  << avg_pair << "\n\n";
 
-    double avg_per_col  = double(msa_score) / L;
-    double avg_per_pair = double(msa_score)
-                        / ( L * (m*(m-1)/2) );
-    std::cout<<"avg per column = "<<avg_per_col
-             <<", avg per pair = "<<avg_per_pair<<"\n\n";
-
+    // 10) Print colored MSA
     printColorMSA(msa);
 
-    // 8) Write MSA to file
-    std::ofstream mf(outdir + "/msa.fasta");
+    // 11) Write out FASTA
+    std::ofstream mf(outdir+"/msa.fasta");
     for (int i = 0; i < n; ++i) {
         mf << ">" << hdrs[i] << "\n"
-           << msa[i] << "\n";
+           << msa[i]  << "\n";
     }
     mf.close();
 
