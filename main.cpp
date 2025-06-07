@@ -23,6 +23,9 @@
 #include <array>
 #include <set>
 #include <immintrin.h>
+#include <omp.h>
+#include <queue>
+#include <tuple>
 #include "EDNAFULL.h"
 #include "EBLOSUM62.h"
 
@@ -33,8 +36,9 @@
 #define CYAN  "\033[36m"
 
 // Gap penalties
-static const double GAP_OPEN   = -5.0;
-static const double GAP_EXTEND = -1.0;
+// instead of “static const”, use mutable globals:
+double GAP_OPEN   = -5.0;
+double GAP_EXTEND = -1.0;
 static const int LINE_WIDTH = 80;
 
 enum ScoreMode { MODE_DNA, MODE_PROTEIN };
@@ -282,56 +286,104 @@ void projectGaps(const std::string &oldc, const std::string &newc, std::vector<s
     }
 }
 
-/** compute identity-based distance matrix **/
-std::vector<std::vector<double>> computeDistanceMatrix(const std::vector<std::string> &seqs, ScoreMode mode, ScoreFn fn){
-    size_t n=seqs.size();
-    std::vector<std::vector<double>> D(n, std::vector<double>(n,0.0));
-    for(size_t i=0;i<n;++i) for(size_t j=i+1;j<n;++j){
-        std::string ax, ay; computeGlobalAlignment(seqs[i],seqs[j],mode,fn,ax,ay);
-        int L=ax.size(), match=0;
-        for(int k=0;k<L;++k) if(ax[k]==ay[k]&&ax[k]!='-') ++match;
-        double id = L? double(match)/L : 0.0;
-        D[i][j]=D[j][i]=1.0 - id;
+/**
+ * @brief Compute identity‐based distance matrix in parallel.
+ */
+std::vector<std::vector<double>>
+computeDistanceMatrix(const std::vector<std::string>& seqs,
+                      ScoreMode mode, ScoreFn fn)
+{
+    size_t n = seqs.size();
+    std::vector<std::vector<double>> D(n, std::vector<double>(n, 0.0));
+
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < (int)n; ++i) {
+        for (int j = i+1; j < (int)n; ++j) {
+            std::string ax, ay;
+            computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay);
+            int L = ax.size(), match = 0;
+            // count matches
+            for (int k = 0; k < L; ++k) {
+                if (ax[k] == ay[k] && ax[k] != '-') ++match;
+            }
+            double identity = (L>0 ? double(match)/L : 0.0);
+            double dist = 1.0 - identity;
+            D[i][j] = D[j][i] = dist;
+        }
     }
     return D;
 }
 
-/** build UPGMA guide tree **/
-std::string buildUPGMATree(std::vector<std::vector<double>> D, const std::vector<std::string> &names){
-    int n=names.size();
-    struct Cl{ std::string nwk; int size; };
-    std::vector<Cl> C(n);
+/**
+ * @brief Build UPGMA tree via a min-heap in O(n^2 log n).
+ *
+ * @param D     Symmetric distance matrix.
+ * @param names Cluster labels (will be updated in place).
+ * @return      Newick string.
+ */
+std::string buildUPGMATree(std::vector<std::vector<double>> D,
+                           std::vector<std::string> names)
+{
+    int n = names.size();
+    struct Cluster { std::string nwk; int size; };
+    std::vector<Cluster> C(n);
     std::vector<bool> alive(n,true);
-    for(int i=0;i<n;++i){ C[i]={names[i],1}; }
-    int aliveCount=n;
-    while(aliveCount>1){
-        // find min dist
-        double best=std::numeric_limits<double>::infinity(); int a=-1,b=-1;
-        for(int i=0;i<n;++i) if(alive[i]) for(int j=i+1;j<n;++j) if(alive[j]){
-            if(D[i][j]<best){ best=D[i][j]; a=i; b=j; }
+    for (int i = 0; i < n; ++i) C[i] = { names[i], 1 };
+
+    // Min‐heap of (distance, a, b)
+    using Entry = std::tuple<double,int,int>;
+    auto cmp = [](Entry const &a, Entry const &b){
+        return std::get<0>(a) > std::get<0>(b);
+    };
+    std::priority_queue<Entry, std::vector<Entry>, decltype(cmp)> pq(cmp);
+
+    // seed heap
+    for (int i = 0; i < n; ++i)
+        for (int j = i+1; j < n; ++j)
+            pq.emplace(D[i][j], i, j);
+
+    int remaining = n;
+    while (remaining > 1) {
+        auto [d, a, b] = pq.top(); pq.pop();
+        if (!alive[a] || !alive[b]) continue;  // stale entry
+
+        // merge b into a
+        double half = d * 0.5;
+        std::ostringstream nw;
+        nw << "(" << C[a].nwk << ":" << half
+           << "," << C[b].nwk << ":" << half << ")";
+        C[a].nwk = nw.str();
+        C[a].size += C[b].size;
+        alive[b] = false;
+        --remaining;
+
+        // update distances from a to all k
+        for (int k = 0; k < n; ++k) {
+            if (alive[k] && k != a) {
+                // weighted average
+                double dk = (D[a][k]*C[a].size + D[b][k]*C[b].size)
+                            / (C[a].size + C[b].size);
+                D[a][k] = D[k][a] = dk;
+                pq.emplace(dk, a, k);
+            }
         }
-        double h = best/2.0;
-        // newick
-        std::ostringstream oss;
-        oss<<"("<<C[a].nwk<<":"<<h<<","<<C[b].nwk<<":"<<h<<")";
-        C[a].nwk = oss.str(); C[a].size += C[b].size;
-        // merge distances
-        for(int k=0;k<n;++k) if(k!=a&&alive[k]){
-            double d = (D[a][k]*C[a].size + D[b][k]*C[b].size)/(C[a].size+C[b].size);
-            D[a][k]=D[k][a]=d;
-        }
-        alive[b]=false; --aliveCount;
     }
-    // root cluster
-    std::string tree;
-    for(int i=0;i<n;++i) if(alive[i]) tree = C[i].nwk + ";";
+
+    // find the last alive cluster
+    std::string tree = ";";
+    for (int i = 0; i < n; ++i) {
+        if (alive[i]) {
+            tree = C[i].nwk + ";";
+            break;
+        }
+    }
     return tree;
 }
 
 /** print MSA with block positions rather than headers **/
 void printColorMSA(const std::vector<std::string> &aln) {
     int m = aln.size();
-    int L = aln[0].size();
+    int L = static_cast<int>(aln[0].size());  // now all aln[i].size() == L
 
     // track “current ungapped” position for each sequence
     std::vector<int> pos(m, 1);
@@ -412,50 +464,69 @@ std::vector<std::string> msa_star(const std::vector<std::string> &hdrs,
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " [--mode dna|protein] outdir file1.fasta file2.fasta [...]\n";
+                  << " [--mode dna|protein] [--gap_open O] [--gap_extend E] "
+                     "outdir file1.fasta file2.fasta [...]\n";
         return 1;
     }
 
-    // 1) Parse --mode
+    // defaults
     ScoreMode mode = MODE_DNA;
-    ScoreFn fn = edna_score;
+    ScoreFn   fn   = edna_score;
+    // GAP_OPEN and GAP_EXTEND are globals, defaulted above
+
     int argi = 1;
-    if (std::string(argv[argi]) == "--mode") {
-        if (argi + 1 >= argc) {
-            std::cerr << "Error: --mode requires 'dna' or 'protein'.\n";
-            return 1;
+    // parse all leading “--” options
+    while (argi < argc && std::string(argv[argi]).rfind("--", 0) == 0) {
+        std::string opt = argv[argi++];
+        if (opt == "--mode") {
+            if (argi >= argc) {
+                std::cerr<<"Error: --mode requires 'dna' or 'protein'.\n";
+                return 1;
+            }
+            std::string m = argv[argi++];
+            if (m == "dna")       { mode = MODE_DNA;     fn = edna_score; }
+            else if (m == "protein") { mode = MODE_PROTEIN; fn = blosum62_score; }
+            else {
+                std::cerr<<"Error: unknown mode '"<<m<<"'. Use dna or protein.\n";
+                return 1;
+            }
         }
-        std::string m = argv[argi+1];
-        if (m == "dna") {
-            mode = MODE_DNA;
-            fn = edna_score;
+        else if (opt == "--gap_open") {
+            if (argi >= argc) {
+                std::cerr<<"Error: --gap_open requires a value.\n";
+                return 1;
+            }
+            GAP_OPEN = std::stod(argv[argi++]);
         }
-        else if (m == "protein") {
-            mode = MODE_PROTEIN;
-            fn = blosum62_score;
+        else if (opt == "--gap_extend") {
+            if (argi >= argc) {
+                std::cerr<<"Error: --gap_extend requires a value.\n";
+                return 1;
+            }
+            GAP_EXTEND = std::stod(argv[argi++]);
         }
         else {
-            std::cerr << "Error: unknown mode '" << m << "'. Use dna or protein.\n";
-            return 1;
+            // not one of our flags → back up and break
+            --argi;
+            break;
         }
-        argi += 2;
     }
 
-    // 2) Next arg is outdir
+    // next argument must be outdir
     if (argi >= argc) {
-        std::cerr << "Error: missing outdir.\n";
+        std::cerr<<"Error: missing outdir.\n";
         return 1;
     }
     std::string outdir = argv[argi++];
     std::filesystem::create_directories(outdir);
 
-    // 3) Remaining args are FASTA files
+    // remaining args are FASTA files
     if (argi >= argc) {
-        std::cerr << "Error: need at least one FASTA file.\n";
+        std::cerr<<"Error: need at least one FASTA file.\n";
         return 1;
     }
     std::vector<std::string> files;
-    for ( ; argi < argc; ++argi) {
+    for (; argi < argc; ++argi) {
         files.emplace_back(argv[argi]);
     }
 
@@ -497,8 +568,39 @@ int main(int argc, char** argv) {
 
     // 6) Do star‐alignment MSA
     auto msa = msa_star(hdrs, seqs, mode, fn);
+    size_t L = 0;
+    for (auto &s : msa) {
+        L = std::max(L, s.size());
+    }
+    // pad shorter ones with gaps:
+    for (auto &s : msa) {
+        if (s.size() < L) {
+            s.append(L - s.size(), '-');
+        }
+    }
 
     // 7) Print color to stdout
+    long long msa_score = 0;
+    int m = msa.size(); L = msa[0].size();
+    for (int j = 0; j < L; ++j) {
+        for (int i = 0; i < m; ++i) {
+            for (int k = i+1; k < m; ++k) {
+                char a = msa[i][j], b = msa[k][j];
+                if (a!='-' && b!='-')
+                    msa_score += score(a, b, mode);
+                else if ((a=='-') ^ (b=='-'))
+                    msa_score += int(GAP_OPEN);
+            }
+        }
+    }
+    std::cout << "\nMSA sum-of-pairs score: " << msa_score << "\n\n";
+
+    double avg_per_col  = double(msa_score) / L;
+    double avg_per_pair = double(msa_score)
+                        / ( L * (m*(m-1)/2) );
+    std::cout<<"avg per column = "<<avg_per_col
+             <<", avg per pair = "<<avg_per_pair<<"\n\n";
+
     printColorMSA(msa);
 
     // 8) Write MSA to file

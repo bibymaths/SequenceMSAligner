@@ -22,7 +22,14 @@ add_executable(msalign
 )
 
 # apply PERF_FLAGS just to this target
-target_compile_options(msalign PRIVATE -O3 -mavx2 -mfma -march=native)
+target_compile_options(msalign PRIVATE
+        -O3
+        -mavx2
+        -mfma
+        -march=native
+        -funroll-loops
+        -fopenmp
+)
 
 # find and link OpenMP
 find_package(OpenMP REQUIRED)
