@@ -19,7 +19,6 @@
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
-#include <cstring>
 #include <climits>
 #include <array>
 #include <set>
@@ -90,10 +89,6 @@ inline int score(char x,char y,ScoreMode mode){
 }
 
 /** in-memory global alignment **/
-#include <immintrin.h>
-
-// …
-
 int computeGlobalAlignment(const std::string &x,
                            const std::string &y,
                            ScoreMode mode,
@@ -104,130 +99,137 @@ int computeGlobalAlignment(const std::string &x,
     const int m = x.size();
     const int n = y.size();
 
-    // Round n up to a multiple of 16
-    int n16 = (n + 15) & ~15;
+    // Round n up to a multiple of 8
+    int n8 = (n + 7) & ~7;
 
-    // DP arrays, padded to n16+1
-    std::vector<int> S_prev(n16+1), S_cur(n16+1);
-    std::vector<int> E_cur(n16+1), F_prev(n16+1);
-    std::vector<char> trace((m+1)*(n+1));
+    // Allocate aligned buffers of length n8+1
+    std::vector<int> S_prev(n8+1), S_cur(n8+1);
+    std::vector<int> E_cur(n8+1), F_prev(n8+1);
+    std::vector<char> trace_buf((m+1)*(n+1));
 
-    // broadcast gap penalties
-    const __m512i vGapOpen512   = _mm512_set1_epi32(int(GAP_OPEN));
-    const __m512i vGapExtend512 = _mm512_set1_epi32(int(GAP_EXTEND));
-    const __m512i vNegInf512    = _mm512_set1_epi32(INT_MIN/2);
+    const __m256i vGapOpen   = _mm256_set1_epi32(int(GAP_OPEN));
+    const __m256i vGapExtend = _mm256_set1_epi32(int(GAP_EXTEND));
+    const __m256i vNegInf    = _mm256_set1_epi32(INT_MIN/2);
 
-    // initialize row 0 (scalar)
+    // init row 0
     S_prev[0] = 0;
-    for(int j=1; j<=n; ++j) {
+    for(int j = 1; j <= n; ++j) {
         int e = (j==1 ? S_prev[j-1] + GAP_OPEN : E_cur[j-1] + GAP_EXTEND);
         S_prev[j] = e;
         E_cur[j]  = e;
         F_prev[j] = INT_MIN/2;
-        trace[j]  = (j==1 ? 'E' : 'e');
+        trace_buf[j] = (j==1 ? 'E' : 'e');
     }
-    // pad the rest
-    for(int j=n+1; j<=n16; ++j) {
-        S_prev[j] = E_cur[j] = F_prev[j] = INT_MIN/2;
+    // pad to n8
+    for(int j = n+1; j <= n8; ++j) {
+        S_prev[j] = INT_MIN/2;
+        E_cur[j]  = INT_MIN/2;
+        F_prev[j] = INT_MIN/2;
     }
 
-    // raw pointers for intrinsics
-    int *Sp = S_prev.data();
-    int *Sc = S_cur.data();
-    int *Ec = E_cur.data();
-    int *Fp = F_prev.data();
+    // temp arrays for vector loads/stores
+    int *Sp  = S_prev.data();
+    int *Sc  = S_cur.data();
+    int *Ec  = E_cur.data();
+    int *Fp  = F_prev.data();
 
-    for(int i=1; i<=m; ++i) {
-        // scalar col 0
-        int oF = Sp[0] + GAP_OPEN;
-        int eF = Fp[0] + GAP_EXTEND;
-        Sc[0] = std::max(oF, eF);
+    for(int i = 1; i <= m; ++i) {
+        // scalar first column
+        int openF = Sp[0] + GAP_OPEN;
+        int extF  = Fp[0] + GAP_EXTEND;
+        Sc[0] = std::max(openF, extF);
         Ec[0] = INT_MIN/2;
         Fp[0] = Sc[0];
-        trace[i*(n+1)+0] = (Sc[0]==oF ? 'F' : 'f');
+        trace_buf[i*(n+1) + 0] = (Sc[0] == openF ? 'F' : 'f');
 
-        // prepare “diagonal” broadcast
-        __m512i vSdiag = _mm512_set1_epi32(Sp[0]);
+        // broadcast S_prev[i-1][j-1] lanewise
+        __m256i vSdiag = _mm256_set1_epi32(Sp[0]);
 
-        // process 16 columns per iteration
-        for(int j=1; j<=n16; j+=16) {
-            // load vectors
-            __m512i vSp  = _mm512_loadu_si512((__m512i*)&Sp[j]);
-            __m512i vFp  = _mm512_loadu_si512((__m512i*)&Fp[j]);
-            __m512i vEcm1= _mm512_loadu_si512((__m512i*)&Ec[j-1]); // E_cur[j-1..]
-            __m512i vScm1= _mm512_loadu_si512((__m512i*)&Sc[j-1]); // S_cur[j-1..]
+        // vectorized inner loop: j=1..n8 step 8
+        for(int j = 1; j <= n8; j += 8) {
+            // load previous vectors
+            __m256i vSp   = _mm256_loadu_si256((__m256i*)&Sp[j]);
+            __m256i vFp   = _mm256_loadu_si256((__m256i*)&Fp[j]);
+            __m256i vEc   = _mm256_loadu_si256((__m256i*)&Ec[j-1]); // note shift for E
+            __m256i vScm1 = _mm256_loadu_si256((__m256i*)&Sc[j-1]); // current S[j-1]
 
-            // F = max( S_prev + open, F_prev + extend )
-            __m512i vF = _mm512_max_epi32(
-                _mm512_add_epi32(vSp, vGapOpen512),
-                _mm512_add_epi32(vFp, vGapExtend512)
+            // compute F = max(S_prev + gapOpen, F_prev + gapExtend)
+            __m256i vF = _mm256_max_epi32(
+                _mm256_add_epi32(vSp, vGapOpen),
+                _mm256_add_epi32(vFp, vGapExtend)
             );
-            // E = max( S_cur[j-1] + open, E_cur[j-1] + extend )
-            __m512i vE = _mm512_max_epi32(
-                _mm512_add_epi32(vScm1, vGapOpen512),
-                _mm512_add_epi32(vEcm1, vGapExtend512)
+
+            // compute E = max(S_cur[j-1] + gapOpen, E_cur[j-1] + gapExtend)
+            __m256i vE = _mm256_max_epi32(
+                _mm256_add_epi32(vScm1, vGapOpen),
+                _mm256_add_epi32(vEc,   vGapExtend)
             );
-            // BestPrev = max( S_prev[j-1], F_prev[j-1], E_prev[j-1] )
-            __m512i vFp_m1 = _mm512_loadu_si512((__m512i*)&Fp[j-1]);
-            __m512i vEp_m1 = _mm512_loadu_si512((__m512i*)&Ec[j-1]);
-            __m512i vBestPrev = _mm512_max_epi32(
-                _mm512_max_epi32(vSdiag, vFp_m1),
-                vEp_m1
+
+            // build vSdiag: prev_S[j-1], prev_F[j-1], prev_E[j-1]
+            __m256i vFp_shift = _mm256_loadu_si256((__m256i*)&Fp[j-1]);
+            __m256i vEp_shift = _mm256_loadu_si256((__m256i*)&Ec[j-1]);
+            __m256i vBestPrev = _mm256_max_epi32(
+                _mm256_max_epi32(vSdiag, vFp_shift),
+                vEp_shift
             );
-            // build match/mismatch vector
-            int scbuf[16];
-            for(int k=0; k<16; ++k) {
-                int idx = j + k - 1;
-                scbuf[k] = (idx < n ? score_fn(x[i-1], y[idx]) : 0);
+
+            // compute match/mismatch scores vector
+            int scores[8];
+            for(int k=0; k<8; ++k) {
+                int idx = j+k-1;
+                int sc = 0;
+                if (idx < n) sc = score_fn(x[i-1], y[idx]);
+                scores[k] = sc;
             }
-            __m512i vMatch = _mm512_loadu_si512((__m512i*)scbuf);
+            __m256i vMatch = _mm256_loadu_si256((__m256i*)scores);
 
             // M = BestPrev + match
-            __m512i vM = _mm512_add_epi32(vBestPrev, vMatch);
-            // S = max( M, E, F )
-            __m512i vS = _mm512_max_epi32(
-                _mm512_max_epi32(vM, vE),
+            __m256i vM = _mm256_add_epi32(vBestPrev, vMatch);
+
+            // S = max(M, E, F)
+            __m256i vS = _mm256_max_epi32(
+                _mm256_max_epi32(vM, vE),
                 vF
             );
 
-            // store DP vectors
-            _mm512_storeu_si512((__m512i*)&Sc[j], vS);
-            _mm512_storeu_si512((__m512i*)&Fp[j], vF);
-            _mm512_storeu_si512((__m512i*)&Ec[j], vE);
+            // store results
+            _mm256_storeu_si256((__m256i*)&Sc[j], vS);
+            _mm256_storeu_si256((__m256i*)&Fp[j], vF);
+            _mm256_storeu_si256((__m256i*)&Ec[j], vE);
 
-            // advance diagonal for next block
+            // prepare next vSdiag = prev_S[j..j+7]
             vSdiag = vSp;
 
-            // scalar traceback pointer for these 16
-            int Sblk[16], Eblk[16], Fblk[16];
-            _mm512_storeu_si512((__m512i*)Sblk, vS);
-            _mm512_storeu_si512((__m512i*)Eblk, vE);
-            _mm512_storeu_si512((__m512i*)Fblk, vF);
-            for(int k=0; k<16; ++k) {
-                int col = j + k;
-                if (col <= n) {
+            // scalar traceback for this block
+            int Sblock[8], Eblock[8], Fblock[8];
+            _mm256_storeu_si256((__m256i*)Sblock, vS);
+            _mm256_storeu_si256((__m256i*)Eblock, vE);
+            _mm256_storeu_si256((__m256i*)Fblock, vF);
+            for(int k=0; k<8; ++k) {
+                if (j+k <= n) {
                     char ptr = 'M';
-                    if      (Sblk[k] == Eblk[k]) ptr = (Eblk[k] == (Ec[col] - GAP_EXTEND) ? 'e' : 'E');
-                    else if (Sblk[k] == Fblk[k]) ptr = (Fblk[k] == (Fp[col] - GAP_EXTEND) ? 'f' : 'F');
-                    trace[i*(n+1) + col] = ptr;
+                    if (Sblock[k] == Eblock[k]) ptr = (Eblock[k] == (Ec[j+k] - GAP_EXTEND) ? 'e' : 'E');
+                    else if (Sblock[k] == Fblock[k]) ptr = (Fblock[k] == (Fp[j+k] - GAP_EXTEND) ? 'f' : 'F');
+                    trace_buf[i*(n+1) + (j+k)] = ptr;
                 }
             }
         }
 
-        // swap pointers for next row
+        // swap rows
         std::swap(Sp, Sc);
         std::swap(Fp, Ec);
     }
 
+    // final score
     int finalScore = Sp[n];
 
-    // scalar traceback (unchanged)
+    // scalar traceback: identical to your existing code
     aligned_x.clear();
     aligned_y.clear();
     int i = m, j = n;
-    while (i>0 || j>0) {
-        char p = trace[i*(n+1) + j];
-        if      (p=='M') { aligned_x.push_back(x[i-1]); aligned_y.push_back(y[j-1]); --i; --j; }
+    while (i > 0 || j > 0) {
+        char p = trace_buf[i*(n+1) + j];
+        if      (p == 'M') { aligned_x.push_back(x[i-1]); aligned_y.push_back(y[j-1]); --i; --j; }
         else if (p=='F'||p=='f') { aligned_x.push_back(x[i-1]); aligned_y.push_back('-'); --i; }
         else if (p=='E'||p=='e') { aligned_x.push_back('-'); aligned_y.push_back(y[j-1]); --j; }
         else {
@@ -239,7 +241,6 @@ int computeGlobalAlignment(const std::string &x,
     std::reverse(aligned_y.begin(), aligned_y.end());
     return finalScore;
 }
-
 
 /** read first FASTA record, uppercase & strip non‐letters **/
 void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
