@@ -1,14 +1,12 @@
-//
-// Created by abhinavmishra on 7/6/25.
-//
-/*
- * @file msa_full.cpp
- * @brief Standalone progressive MSA with guide-tree (UPGMA), color output, and file saving.
- * @author ChatGPT
- * @date 2025-06-07
+/* @file main.cpp
+ * @brief Main file for a multiple sequence alignment tool.
+ * This tool supports both DNA and protein sequences, implements
+ * multiple sequence alignment using a star method,
+ * and allows for iterative refinement of the alignment.
  *
- * Usage: ./msa_full outdir file1.fasta file2.fasta [...]
+ * Author: Abhinav Mishra
  */
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -38,11 +36,12 @@
 #define CYAN  "\033[36m"
 
 // Gap penalties
-// instead of “static const”, use mutable globals:
+// Use mutable variables
 double GAP_OPEN   = -5.0;
 double GAP_EXTEND = -1.0;
 static const int LINE_WIDTH = 80;
 
+// Scoring modes
 enum ScoreMode { MODE_DNA, MODE_PROTEIN };
 using ScoreFn = int(*)(char,char);
 
@@ -64,6 +63,15 @@ static const std::array<uint8_t,256> prot_idx = [](){
     return m;
 }();
 
+/**
+* @brief Computes the BLOSUM62 score for a pair of amino acids.
+* This function maps characters to their corresponding indices in the BLOSUM62 matrix
+* and returns the score for the pair.
+*
+* @param x The first amino acid character.
+* @param y The second amino acid character.
+* @return The BLOSUM62 score for the pair.
+*/
 inline int blosum62_score(char x, char y) {
     // map to uppercase in case it slipped through
     x = static_cast<char>(std::toupper((unsigned char)x));
@@ -77,6 +85,15 @@ inline int blosum62_score(char x, char y) {
     return static_cast<int>(std::round(EBLOSUM62_matrix[ix][iy]));
 }
 
+/**
+* @brief Computes the score for a pair of characters using the appropriate scoring matrix.
+* This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein sequences.
+*
+* @param x The first character.
+* @param y The second character.
+* @param mode The scoring mode (DNA or Protein).
+* @return The score for the character pair.
+*/
 inline int edna_score(char x, char y) {
     x = static_cast<char>(std::toupper((unsigned char)x));
     y = static_cast<char>(std::toupper((unsigned char)y));
@@ -89,12 +106,31 @@ inline int edna_score(char x, char y) {
     return static_cast<int>(std::round(EDNAFULL_matrix[ix][iy]));
 }
 
-
+/**
+ * @brief Computes the score for a pair of characters based on the specified scoring mode.
+ * This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein sequences.
+ *
+ * @param x The first character.
+ * @param y The second character.
+ * @param mode The scoring mode (DNA or Protein).
+ * @return The score for the character pair.
+ */
 inline int score(char x,char y,ScoreMode mode){
     return mode==MODE_DNA ? edna_score(x,y) : blosum62_score(x,y);
 }
 
-/** in-memory global alignment **/
+/**
+ * @brief Computes the global alignment score between two sequences using a modified
+ *        Needleman-Wunsch algorithm with AVX2 vectorization.
+ *
+ * @param x The first sequence.
+ * @param y The second sequence.
+ * @param mode The scoring mode (DNA or Protein).
+ * @param score_fn The scoring function to use for matches/mismatches.
+ * @param aligned_x Output string for the aligned first sequence.
+ * @param aligned_y Output string for the aligned second sequence.
+ * @return The final alignment score.
+ */
 int computeGlobalAlignment(const std::string &x,
                            const std::string &y,
                            ScoreMode mode,
@@ -215,7 +251,7 @@ int computeGlobalAlignment(const std::string &x,
                 if (j+k <= n) {
                     char ptr = 'M'; // Default to Match
                     // The highest score determines the path.
-                    // This is safe and avoids the out-of-bounds read.
+                    // avoids the out-of-bounds read.
                     if (Sblock[k] == Eblock[k]) {
                         ptr = 'E'; // Gap in sequence X (Insertion)
                     } else if (Sblock[k] == Fblock[k]) {
@@ -253,9 +289,9 @@ int computeGlobalAlignment(const std::string &x,
     return finalScore;
 }
 
-/**
- * @brief Replaces characters in a header that can interfere with parsing.
- * This version replaces ALL whitespace (spaces, tabs, etc.) with underscores.
+/** @brief Sanitizes a FASTA header by replacing spaces with underscores.
+ * This is useful for ensuring that headers are valid identifiers in various contexts.
+ * @param header The header string to sanitize.
  */
 void sanitize_header(std::string& header) {
     for (char &c : header) {
@@ -265,7 +301,15 @@ void sanitize_header(std::string& header) {
     }
 }
 
-/** read first FASTA record, uppercase & strip non‐letters **/
+/**
+ * @brief Processes a FASTA file to extract the header and sequence.
+ * This function reads a FASTA file, extracts the first header line,
+ * and concatenates all sequence lines into a single uppercase string.
+ *
+ * @param fn The filename of the FASTA file.
+ * @param hdr Output parameter for the header (without '>' prefix).
+ * @param seq Output parameter for the sequence (uppercase, no gaps).
+ */
 void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
     std::ifstream f(fn);
     if (!f) throw std::runtime_error("Cannot open " + fn);
@@ -293,8 +337,12 @@ void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
 }
 
 /**
- * @brief Generates a consensus sequence from a profile (MSA).
- * For each column, the most frequent non-gap character is chosen.
+ * @brief Generates a consensus sequence from a multiple sequence alignment profile.
+ * This function computes the most frequent character in each column of the profile,
+ * ignoring gaps ('-'), and returns the resulting consensus sequence.
+ *
+ * @param profile A vector of strings representing the aligned sequences.
+ * @return The consensus sequence as a string.
  */
 std::string generate_consensus(const std::vector<std::string>& profile) {
     if (profile.empty() || profile[0].empty()) {
@@ -393,7 +441,7 @@ void projectGaps(const std::string &oldc, const std::string &newc, std::vector<s
     for (size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
         // Check if the character in the new sequence corresponds to a character from the old one
         if (old_idx < oldc.size() && newc[new_idx] == oldc[old_idx]) {
-            old_idx++; // It's a character from the old sequence, just advance the pointer.
+            old_idx++; // advance the pointer.
         } else {
             // This is a new gap that was inserted.
             // Insert a column of gaps into the profile at this new position.
@@ -609,7 +657,7 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int ro
         }
     }
 
-    std::cout << "\nFinished parallel refinement. Final score: " << global_best_score << std::endl;
+    std::cout << "\nFinished parallel refinement. Final score: " << global_best_score << "\n\n" << std::endl;
     return global_best_msa;
 }
 
@@ -841,14 +889,14 @@ GapSearchResult find_optimal_gap_penalties(
     ScoreMode mode,
     ScoreFn fn)
 {
-    std::cout << "\n--- Starting parallel search for optimal gap penalties ---" << std::endl;
+    std::cout << "\n--- Starting parallel search for optimal gap penalties ---\n\n" << std::endl;
 
     // 1. Define the grid of parameters to search
     std::vector<double> open_penalties;
-    for (double o = -25.0; o <= -1.0; o += 1.0) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
+    for (double o = -25.0; o <= -10.0; o += 2.5) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
 
     std::vector<double> extend_penalties;
-    for (double e = -25.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
+    for (double e = -5.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
 
     std::vector<GapSearchResult> results(open_penalties.size() * extend_penalties.size());
 
@@ -905,7 +953,7 @@ GapSearchResult find_optimal_gap_penalties(
         }
     }
 
-    std::cout << "--- Finished parameter search ---" << std::endl;
+    std::cout << "\n\n--- Finished parameter search ---" << std::endl;
     return best_result;
 }
 
@@ -1064,7 +1112,7 @@ int main(int argc, char** argv) {
     // --- ADDED PARALLEL REFINEMENT STEP ---
     // Refine the MSA using multiple threads over several rounds
     int total_rounds = 3;
-    int iterations_per_thread_per_round = 100; // Total work = rounds * iterations * num_threads
+    int iterations_per_thread_per_round = 10; // Total work = rounds * iterations * num_threads
     msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn);
 
     // 10) Print colored MSA
