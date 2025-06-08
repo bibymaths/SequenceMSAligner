@@ -1149,7 +1149,7 @@ GapSearchResult find_optimal_gap_penalties(
     ScoreMode mode,
     ScoreFn fn)
 {
-    std::cout << "\n--- Starting parallel search for optimal gap penalties ---" << std::endl;
+    std::cout << "\n--- Starting search for optimal gap penalties ---" << std::endl;
 
     // 1. Define the grid of parameters to search
     std::vector<double> open_penalties;
