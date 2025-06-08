@@ -610,11 +610,11 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
 
             // This console output is preserved. It will show progress from individual threads.
             // It's helpful for seeing how active the search is.
-            #pragma omp critical
-            {
-                std::cout << "  Thread " << omp_get_thread_num()
-                          << " found a better score: " << best_score << std::endl;
-            }
+            // #pragma omp critical
+            // {
+            //     std::cout << "  Thread " << omp_get_thread_num()
+            //               << " found a better score: " << best_score << std::endl;
+            // }
         }
     }
     // Return the best alignment this specific worker was able to find.
@@ -650,14 +650,14 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int ro
         for (int i = 0; i < num_threads; ++i) {
             long long thread_score = calculate_sp_score(thread_results[i], mode, fn);
             if (thread_score > global_best_score) {
-                std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better score: " << thread_score << std::endl;
+                // std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better score: " << thread_score << std::endl;
                 global_best_score = thread_score;
                 global_best_msa = thread_results[i];
             }
         }
     }
 
-    std::cout << "\nFinished parallel refinement. Final score: " << global_best_score << "\n\n" << std::endl;
+    std::cout << "\nFinished Iterative refinement. Final score: " << global_best_score << "\n\n" << std::endl;
     return global_best_msa;
 }
 
@@ -889,7 +889,7 @@ GapSearchResult find_optimal_gap_penalties(
     ScoreMode mode,
     ScoreFn fn)
 {
-    std::cout << "\n--- Starting parallel search for optimal gap penalties ---\n\n" << std::endl;
+    std::cout << "\n--- Starting parallel search for optimal gap penalties ---" << std::endl;
 
     // 1. Define the grid of parameters to search
     std::vector<double> open_penalties;
@@ -936,10 +936,10 @@ GapSearchResult find_optimal_gap_penalties(
             int index = i * extend_penalties.size() + j;
             results[index] = {score, GAP_OPEN, GAP_EXTEND};
 
-            #pragma omp critical
-            {
-                std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << "). Score: " << score << std::endl;
-            }
+            // #pragma omp critical
+            // {
+            //     std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << "). Score: " << score << std::endl;
+            // }
 
             // A more complete implementation would free the memory allocated by parseNewick here.
         }
@@ -953,7 +953,7 @@ GapSearchResult find_optimal_gap_penalties(
         }
     }
 
-    std::cout << "\n\n--- Finished parameter search ---" << std::endl;
+    std::cout << "\n--- Finished parameter search ---" << std::endl;
     return best_result;
 }
 
