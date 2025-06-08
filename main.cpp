@@ -7,6 +7,7 @@
  * Author: Abhinav Mishra
  */
 
+#include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -47,7 +48,7 @@ using ScoreFn = int(*)(char,char);
 
 // DNA / EDNAFULL lookup
 static const std::array<uint8_t,256> char2idx = [](){
-    std::array<uint8_t,256> m; m.fill(255);
+    std::array<uint8_t,256> m{}; m.fill(255);
     m['A']=0; m['C']=1; m['G']=2; m['T']=3; m['U']=3;
     m['R']=4; m['Y']=5; m['S']=6; m['W']=7;
     m['K']=8; m['M']=9; m['B']=10; m['D']=11;
@@ -57,7 +58,7 @@ static const std::array<uint8_t,256> char2idx = [](){
 
 // Protein / BLOSUM62 lookup
 static const std::array<uint8_t,256> prot_idx = [](){
-    std::array<uint8_t,256> m; m.fill(255);
+    std::array<uint8_t,256> m{}; m.fill(255);
     const char* AA="ARNDCQEGHILKMFPSTWYVBZX*";
     for(int i=0; AA[i]; ++i) m[(uint8_t)AA[i]] = i;
     return m;
@@ -91,7 +92,6 @@ inline int blosum62_score(char x, char y) {
 *
 * @param x The first character.
 * @param y The second character.
-* @param mode The scoring mode (DNA or Protein).
 * @return The score for the character pair.
 */
 inline int edna_score(char x, char y) {
@@ -151,7 +151,6 @@ int computeGlobalAlignment(const std::string &x,
 
     const __m256i vGapOpen   = _mm256_set1_epi32(int(GAP_OPEN));
     const __m256i vGapExtend = _mm256_set1_epi32(int(GAP_EXTEND));
-    const __m256i vNegInf    = _mm256_set1_epi32(INT_MIN/2);
 
     // init row 0
     S_prev[0] = 0;
@@ -481,6 +480,70 @@ computeDistanceMatrix(const std::vector<std::string>& seqs,
 }
 
 /**
+ * @brief Saves the pairwise identity matrix to a formatted text file.
+ * The output is aligned in columns for readability. The identity is calculated
+ * from the distance matrix (identity % = (1.0 - distance) * 100).
+ *
+ * @param D The distance matrix.
+ * @param hdrs A vector of the sequence headers.
+ * @param outdir The directory where the output file will be saved.
+ */
+void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
+                        const std::vector<std::string>& hdrs,
+                        const std::string& outdir)
+{
+    if (D.empty() || D.size() != hdrs.size()) {
+        std::cerr << "Warning: Cannot save identity matrix due to size mismatch or empty data." << std::endl;
+        return;
+    }
+
+    const std::string output_filepath = outdir + "/identity_matrix.txt";
+    std::ofstream matrix_file(output_filepath);
+
+    if (!matrix_file.is_open()) {
+        std::cerr << "Error: Could not open " << output_filepath << " for writing." << std::endl;
+        return;
+    }
+
+    size_t n = hdrs.size();
+
+    // Find the length of the longest header to format the output neatly
+    size_t max_hdr_len = 0;
+    for(const auto& h : hdrs) {
+        if (h.length() > max_hdr_len) {
+            max_hdr_len = h.length();
+        }
+    }
+    // Add some padding
+    max_hdr_len += 4;
+
+    // Set formatting for floating point numbers
+    matrix_file << std::fixed << std::setprecision(2);
+
+    for (size_t i = 0; i < n; ++i) {
+        // Print the row number (e.g., "1:") and the left-aligned header
+        matrix_file << std::setw(5) << std::right << std::to_string(i + 1) + ":"
+                    << " " << std::setw(max_hdr_len) << std::left << hdrs[i];
+
+        // Print the identity values for the entire row
+        for (size_t j = 0; j < n; ++j) {
+            double identity_percent = 0.0;
+            if (i == j) {
+                identity_percent = 100.0;
+            } else {
+                // The distance matrix D is symmetric
+                identity_percent = (1.0 - D[i][j]) * 100.0;
+            }
+            matrix_file << std::setw(8) << std::right << identity_percent;
+        }
+        matrix_file << "\n";
+    }
+
+    matrix_file.close();
+    // std::cout << "\nPairwise identity matrix saved to: " << output_filepath << std::endl;
+}
+
+/**
  * @brief Build UPGMA tree via a min-heap in O(n^2 log n).
  *
  * @param D     Symmetric distance matrix.
@@ -697,7 +760,6 @@ void printColorMSA(const std::vector<std::string> &aln) {
             // figure out column‐conservation for color
             for (int j = start; j < end; ++j) {
                 char c = aln[i][j];
-                bool isGap = (c == '-');
                 // check if this column is fully conserved non‐gap
                 bool fullyConserved = true;
                 for (int x = 0; x < m; ++x) {
@@ -720,8 +782,139 @@ void printColorMSA(const std::vector<std::string> &aln) {
     }
 }
 
+/**
+ * @brief Saves the final MSA to a styled HTML file for visualization.
+ * This creates a color-coded alignment with sequence start and end positions
+ * for each block, similar to the console output.
+ *
+ * @param aln The final multiple sequence alignment.
+ * @param hdrs A vector of the original, finalized sequence headers (used for tooltips).
+ * @param outdir The directory where the output HTML file will be saved.
+ */
+void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std::string>& hdrs, const std::string& outdir) {
+    if (aln.empty()) {
+        std::cerr << "Warning: Cannot generate HTML for an empty alignment." << std::endl;
+        return;
+    }
 
-/** star MSA **/
+    if (aln.size() != hdrs.size()) {
+        std::cerr << "Error: Mismatch between alignment size and header size." << std::endl;
+        return;
+    }
+
+    const std::string output_filepath = outdir + "/msa_visualization.html";
+    std::ofstream html_file(output_filepath);
+
+    if (!html_file.is_open()) {
+        std::cerr << "Error: Could not open " << output_filepath << " for writing." << std::endl;
+        return;
+    }
+
+    // 1. Write the HTML header and CSS for the combined layout
+    html_file << R"delimiter(<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MSA Visualization (Combined)</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f8f9fa; color: #212529; }
+    h1 { color: #343a40; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; }
+    pre { font-family: 'Consolas', 'Menlo', 'Courier New', monospace; font-size: 14px; line-height: 1.2; border: 1px solid #ced4da; padding: 15px; border-radius: 8px; background-color: #ffffff; white-space: pre; overflow-x: auto; }
+    .line-container { display: flex; align-items: center; margin-bottom: 3px; }
+    .header { flex: 0 0 220px; font-weight: bold; color: #495057; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .position { flex: 0 0 70px; text-align: right; font-weight: bold; color: #6c757d; }
+    .sequence-block { margin: 0 15px; }
+    .conserved { color: #ffffff; background-color: #198754; font-weight: bold; }
+    .residue { color: #212529; background-color: #e9ecef; }
+    .gap { color: #dc3545; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Multiple Sequence Alignment</h1>
+  <pre>)delimiter";
+
+    // 2. Position calculation and alignment block writing
+    const size_t num_sequences = aln.size();
+    const size_t alignment_length = aln[0].length();
+    const int LINE_WIDTH = 80;
+
+    // Track "current ungapped" position for each sequence, starting from 1
+    std::vector<int> pos(num_sequences, 1);
+
+    for (size_t start_col = 0; start_col < alignment_length; start_col += LINE_WIDTH) {
+        size_t end_col = std::min(start_col + LINE_WIDTH, alignment_length);
+
+        // For each sequence, get the start coordinate of this block
+        std::vector<int> block_start = pos;
+
+        // Scan through the block to advance the main 'pos' vector for the *next* block
+        for (size_t j = start_col; j < end_col; ++j) {
+            for (size_t i = 0; i < num_sequences; ++i) {
+                if (aln[i][j] != '-') {
+                    pos[i]++;
+                }
+            }
+        }
+
+        // The end coordinate for this block is the newly advanced position minus 1
+        std::vector<int> block_end(num_sequences);
+        for (size_t i = 0; i < num_sequences; ++i) {
+            block_end[i] = pos[i] - 1;
+        }
+
+        // Print each sequence line for this block
+        for (size_t i = 0; i < num_sequences; ++i) {
+            html_file << "<div class=\"line-container\">";
+
+            // Layout: [Header] [Start Pos] [Sequence] [End Pos]
+            html_file << "<span class=\"header\" title=\"" << hdrs[i] << "\">" << hdrs[i] << "</span>"
+                      << "<span class=\"position\">" << block_start[i] << "</span>"
+                      << "<span class=\"sequence-block\">";
+
+            // Write the colored characters for the current block
+            for (size_t j = start_col; j < end_col; ++j) {
+                char current_char = aln[i][j];
+                bool is_fully_conserved = (current_char != '-');
+                if (is_fully_conserved) {
+                    for (size_t x = 0; x < num_sequences; ++x) {
+                        if (aln[x][j] != current_char) {
+                            is_fully_conserved = false;
+                            break;
+                        }
+                    }
+                }
+                if (current_char == '-') { html_file << "<span class=\"gap\">-</span>"; }
+                else if (is_fully_conserved) { html_file << "<span class=\"conserved\">" << current_char << "</span>"; }
+                else { html_file << "<span class=\"residue\">" << current_char << "</span>"; }
+            }
+            html_file << "</span>"; // Close sequence-block
+
+            // Print the end position and close the line container
+            html_file << "<span class=\"position\">" << block_end[i] << "</span></div>\n";
+        }
+        html_file << "\n"; // Blank line between blocks
+    }
+
+    // 3. Write HTML footer
+    html_file << R"delimiter(  </pre>
+</body>
+</html>)delimiter";
+
+    html_file.close();
+}
+
+/**
+ * @brief Computes a multiple sequence alignment using the STAR method.
+ * This function iteratively aligns sequences to a growing center sequence,
+ * projecting gaps from the center into the aligned sequences.
+ *
+ * @param hdrs The headers of the sequences (used for output).
+ * @param seqs The sequences to align.
+ * @param mode The scoring mode (DNA or Protein).
+ * @param fn The scoring function to use.
+ * @return A vector of aligned sequences.
+ */
 std::vector<std::string> msa_star(const std::vector<std::string> &hdrs,
                                   const std::vector<std::string> &seqs,
                                   ScoreMode mode, ScoreFn fn)
@@ -751,8 +944,13 @@ struct Node {
 };
 
 /**
- * @brief Parses a Newick format string into a binary tree of Nodes.
- * This version is more robust and correctly handles names, delimiters, and branch lengths.
+ * @brief Parses a Newick formatted tree string into a binary tree structure.
+ * This function constructs a binary tree from a Newick string, where each leaf node
+ * corresponds to a sequence index from the provided names vector.
+ *
+ * @param nwk The Newick formatted string representing the guide tree.
+ * @param names A vector of sequence names corresponding to the leaf nodes.
+ * @return A pointer to the root of the constructed binary tree.
  */
 Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names) {
     auto find_name_index = [&](const std::string& name) {
@@ -818,9 +1016,63 @@ Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names)
 }
 
 /**
- * @brief Recursively builds a multiple sequence alignment by walking the guide tree.
- * * This corrected version handles leaf nodes, unary nodes (one child), and binary
- * nodes (two children) to prevent segmentation faults.
+ * @brief Formats a compact single-line Newick string into a multi-line,
+ * indented format for better readability.
+ *
+ * @param nwk The single-line Newick string generated by the UPGMA function.
+ * @return A std::string containing the formatted, multi-line tree.
+ */
+std::string formatNewickString(const std::string& nwk) {
+    if (nwk.empty()) {
+        return "";
+    }
+
+    std::ostringstream formatted_tree;
+    int indent_level = 0;
+    const std::string indent_unit = "    "; // Use 4 spaces for each indentation level
+
+    for (char c : nwk) {
+        if (c == ')') {
+            // A closing parenthesis decreases indentation and moves to a new line before being printed.
+            indent_level--;
+            formatted_tree << "\n";
+            for (int i = 0; i < indent_level; ++i) {
+                formatted_tree << indent_unit;
+            }
+        }
+
+        // Print the character itself
+        formatted_tree << c;
+
+        if (c == '(') {
+            // An opening parenthesis increases indentation and starts a new line after being printed.
+            indent_level++;
+            formatted_tree << "\n";
+            for (int i = 0; i < indent_level; ++i) {
+                formatted_tree << indent_unit;
+            }
+        } else if (c == ',') {
+            // A comma starts a new line at the same indentation level.
+            formatted_tree << "\n";
+            for (int i = 0; i < indent_level; ++i) {
+                formatted_tree << indent_unit;
+            }
+        }
+    }
+
+    formatted_tree << "\n"; // Add a final newline for a clean file ending.
+    return formatted_tree.str();
+}
+
+/**
+ * @brief Recursively builds a profile for a binary tree node.
+ * This function constructs the MSA profile for each node in the tree,
+ * aligning child profiles and projecting gaps as necessary.
+ *
+ * @param n The current node in the binary tree.
+ * @param mode The scoring mode (DNA or Protein).
+ * @param fn The scoring function to use.
+ * @return A vector of aligned sequences representing the profile at this node.
  */
 std::vector<std::string>
 build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
@@ -881,7 +1133,15 @@ struct GapSearchResult {
 };
 
 /**
- * @brief Performs a parallel grid search to find the optimal gap penalties for a set of sequences.
+ * @brief Searches for the optimal gap penalties in parallel.
+ * This function performs a grid search over a range of gap open and extend penalties,
+ * building a complete MSA for each combination and returning the best scoring one.
+ *
+ * @param initial_seqs The initial sequences to align.
+ * @param initial_hdrs The headers corresponding to the initial sequences.
+ * @param mode The scoring mode (DNA or Protein).
+ * @param fn The scoring function to use.
+ * @return A GapSearchResult containing the best score and corresponding gap penalties.
  */
 GapSearchResult find_optimal_gap_penalties(
     const std::vector<std::string>& initial_seqs,
@@ -957,6 +1217,88 @@ GapSearchResult find_optimal_gap_penalties(
     return best_result;
 }
 
+/**
+ * @brief Analyzes a final MSA to find positional matches for the consensus sequence
+ * and saves the consensus and a detailed report to files.
+ *
+ * @param msa The final multiple sequence alignment.
+ * @param hdrs A vector of the original sequence headers.
+ * @param consensus_seq The pre-computed consensus sequence of the MSA.
+ * @param outdir The directory where the output files will be saved.
+ */
+void analyze_and_save_consensus(
+    const std::vector<std::string>& msa,
+    const std::vector<std::string>& hdrs,
+    const std::string& consensus_seq,
+    const std::string& outdir)
+{
+    if (msa.empty()) {
+        return;
+    }
+
+    // Open the output file for the detailed report
+    std::ofstream report_file(outdir + "/consensus_details.txt");
+    if (!report_file) {
+        std::cerr << "Warning: Could not open consensus_details.txt for writing." << std::endl;
+        return;
+    }
+
+    report_file << "Consensus Sequence Match Report\n";
+    report_file << "---------------------------------\n\n";
+
+    int num_seqs = msa.size();
+    int align_len = msa[0].size();
+
+    // This vector tracks the original, un-aligned position for each sequence
+    std::vector<int> original_positions(num_seqs, 0);
+
+    // Iterate through each column of the final alignment
+    for (int j = 0; j < align_len; ++j) {
+        char consensus_char = consensus_seq[j];
+
+        // We only report on columns where the consensus is not a gap
+        if (consensus_char != '-') {
+            report_file << "Alignment Column: " << std::setw(5) << j + 1
+                        << "  |  Consensus: " << consensus_char << "\n";
+
+            // Check each sequence in the column for a match
+            for (int i = 0; i < num_seqs; ++i) {
+                char seq_char = msa[i][j];
+
+                // If the character in the sequence is not a gap, its original position counter increases
+                if (seq_char != '-') {
+                    original_positions[i]++;
+                }
+
+                // If this sequence's character matches the consensus character, record it
+                if (seq_char == consensus_char) {
+                    report_file << "  - Match: Seq '" << hdrs[i]
+                                << "' at original position " << original_positions[i] << "\n";
+                }
+            }
+            report_file << "\n"; // Add a newline for readability between columns
+        } else {
+            // If the consensus is a gap, we still need to advance the position counters
+            // for any sequence that has a residue in this column.
+            for (int i = 0; i < num_seqs; ++i) {
+                if (msa[i][j] != '-') {
+                    original_positions[i]++;
+                }
+            }
+        }
+    }
+    report_file.close();
+}
+
+/**
+ * @brief Main function to run the MSA pipeline.
+ * This function orchestrates reading input files, processing sequences,
+ * computing the MSA, and saving results.
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return Exit status code.
+ */
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
@@ -1050,7 +1392,7 @@ int main(int argc, char** argv) {
     }
 
 
-    // --- ADDED: Find Optimal Gap Penalties before proceeding ---
+    // Find Optimal Gap Penalties before proceeding
     auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
     GAP_OPEN = best_params.gap_open;
     GAP_EXTEND = best_params.gap_extend;
@@ -1074,9 +1416,15 @@ int main(int argc, char** argv) {
 
     // 6) Compute guide tree
     auto D    = computeDistanceMatrix(seqs, mode, fn);
+    // Save the identity matrix to a file
+    saveIdentityMatrix(D, hdrs, outdir);
     auto nwk  = buildUPGMATree(D, hdrs);
+
+    // Format the Newick string for readability before saving
+    std::string nwk_formatted = formatNewickString(nwk);
+
     std::ofstream tf(outdir+"/guide_tree.nwk");
-    tf << nwk << "\n";
+    tf << nwk_formatted; // The formatted string already contains newlines
     tf.close();
 
     // 7) Progressive MSA by walking the UPGMA tree
@@ -1091,7 +1439,6 @@ int main(int argc, char** argv) {
         if (!u) continue; // Skip if a null pointer somehow got on the queue
 
         if (u->leaf) {
-            // --- ADDED SAFETY CHECK ---
             // Verify the index is valid before accessing the 'seqs' vector.
             if (u->seq_index < 0 || u->seq_index >= seqs.size()) {
                 std::cerr << "\nFATAL LOGIC ERROR: Invalid sequence index " << u->seq_index
@@ -1106,19 +1453,29 @@ int main(int argc, char** argv) {
         }
     }
 
-    //    recursively build the full MSA
+    // recursively build the full MSA
     auto msa = build_profile(root, mode, fn);
 
-    // --- ADDED PARALLEL REFINEMENT STEP ---
     // Refine the MSA using multiple threads over several rounds
     int total_rounds = 3;
     int iterations_per_thread_per_round = 10; // Total work = rounds * iterations * num_threads
     msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn);
 
-    // 10) Print colored MSA
+    // 10) Print and save colored MSA
     printColorMSA(msa);
+    saveMSA_to_HTML(msa, hdrs, outdir);
 
-    // 11) Write out FASTA
+    // 11) Analyze and Save Consensus Sequence
+    // First, generate the final consensus sequence from the final MSA
+    std::string final_consensus = generate_consensus(msa);
+    // Second, write the simple consensus sequence to a FASTA file
+    std::ofstream cf(outdir + "/consensus.fasta");
+    cf << ">consensus\n" << final_consensus << "\n";
+    cf.close();
+    // Third, create the detailed report of positional matches
+    analyze_and_save_consensus(msa, hdrs, final_consensus, outdir);
+
+    // 12) Write out main MSA in FASTA format
     std::ofstream mf(outdir+"/msa.fasta");
     for (int i = 0; i < n; ++i) {
         mf << ">" << hdrs[i] << "\n"
