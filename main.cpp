@@ -27,6 +27,7 @@
 #include <tuple>
 #include <stack>
 #include <cctype>
+#include <random>
 #include "EDNAFULL.h"
 #include "EBLOSUM62.h"
 
@@ -212,9 +213,14 @@ int computeGlobalAlignment(const std::string &x,
             _mm256_storeu_si256((__m256i*)Fblock, vF);
             for(int k=0; k<8; ++k) {
                 if (j+k <= n) {
-                    char ptr = 'M';
-                    if (Sblock[k] == Eblock[k]) ptr = (Eblock[k] == (Ec[j+k] - GAP_EXTEND) ? 'e' : 'E');
-                    else if (Sblock[k] == Fblock[k]) ptr = (Fblock[k] == (Fp[j+k] - GAP_EXTEND) ? 'f' : 'F');
+                    char ptr = 'M'; // Default to Match
+                    // The highest score determines the path.
+                    // This is safe and avoids the out-of-bounds read.
+                    if (Sblock[k] == Eblock[k]) {
+                        ptr = 'E'; // Gap in sequence X (Insertion)
+                    } else if (Sblock[k] == Fblock[k]) {
+                        ptr = 'F'; // Gap in sequence Y (Deletion)
+                    }
                     trace_buf[i*(n+1) + (j+k)] = ptr;
                 }
             }
@@ -247,6 +253,15 @@ int computeGlobalAlignment(const std::string &x,
     return finalScore;
 }
 
+/**
+ * @brief Replaces characters in a header that can interfere with parsing, like spaces.
+ */
+void sanitize_header(std::string& header) {
+    // Replace spaces with underscores. Spaces are common culprits in breaking
+    // formats like Newick.
+    std::replace(header.begin(), header.end(), ' ', '_');
+}
+
 /** read first FASTA record, uppercase & strip non‐letters **/
 void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
     std::ifstream f(fn);
@@ -274,15 +289,114 @@ void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
     }
 }
 
+/**
+ * @brief Generates a consensus sequence from a profile (MSA).
+ * For each column, the most frequent non-gap character is chosen.
+ */
+std::string generate_consensus(const std::vector<std::string>& profile) {
+    if (profile.empty() || profile[0].empty()) {
+        return "";
+    }
+    std::string consensus = "";
+    int align_len = profile[0].size();
+    int num_seqs = profile.size();
 
-/** star‐alignment projection **/
-void projectGaps(const std::string &oldc, const std::string &newc, std::vector<std::string> &seqs){
-    size_t idx_old=0;
-    for(size_t j=0;j<newc.size();++j){
-        if(newc[j]=='-'){
-            for(auto &s:seqs) s.insert(s.begin()+j,'-');
+    for (int j = 0; j < align_len; ++j) {
+        std::array<int, 256> counts{}; // Initialize all counts to 0
+        int max_count = 0;
+        char best_char = '-';
+
+        for (int i = 0; i < num_seqs; ++i) {
+            char c = profile[i][j];
+            if (c != '-') {
+                counts[static_cast<unsigned char>(c)]++;
+                if (counts[static_cast<unsigned char>(c)] > max_count) {
+                    max_count = counts[static_cast<unsigned char>(c)];
+                    best_char = c;
+                }
+            }
+        }
+        consensus += best_char;
+    }
+    return consensus;
+}
+
+/**
+ * @brief Calculates the Sum-of-Pairs (SP) score for a given MSA with a true affine gap penalty.
+ * This version iterates over each pair of sequences to correctly apply open and extend penalties.
+ */
+long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode, ScoreFn fn) {
+    if (msa.empty() || msa[0].empty()) {
+        return 0;
+    }
+    long long total_score = 0;
+    int num_seqs = msa.size();
+    int align_len = msa[0].size();
+
+    // Iterate over every unique pair of sequences in the alignment (i and k)
+    for (int i = 0; i < num_seqs; ++i) {
+        for (int k = i + 1; k < num_seqs; ++k) {
+
+            // For each pair, we must track the gap state independently.
+            // A gap between seqs i and k is independent of a gap between i and j.
+            bool in_gap_for_this_pair = false;
+
+            // Now, score this specific pair across all columns of the alignment.
+            for (int j = 0; j < align_len; ++j) {
+                char char_i = msa[i][j];
+                char char_k = msa[k][j];
+
+                // Check the type of alignment in this column for this pair
+                if (char_i != '-' && char_k != '-') {
+                    // --- Case 1: Residue vs Residue ---
+                    // This is a standard match/mismatch.
+                    total_score += score(char_i, char_k, mode);
+                    in_gap_for_this_pair = false; // The gap (if any) has ended.
+
+                } else if (char_i != char_k) { // This condition is true only for Residue vs Gap
+                    // --- Case 2: Residue vs Gap ---
+                    if (in_gap_for_this_pair) {
+                        // We are already in a gap, so this is an extension.
+                        total_score += (long long)GAP_EXTEND;
+                    } else {
+                        // This is the first column of a new gap for this pair.
+                        // Apply both the open and the first extend penalty.
+                        total_score += (long long)GAP_OPEN + (long long)GAP_EXTEND;
+                    }
+                    in_gap_for_this_pair = true; // We are now in a gap state.
+
+                } else {
+                    // --- Case 3: Gap vs Gap ---
+                    // No score is added or subtracted.
+                    // The 'in_gap' state simply continues.
+                    in_gap_for_this_pair = true;
+                }
+            }
+        }
+    }
+    return total_score;
+}
+
+
+/**
+ * @brief Projects gaps from a newly aligned representative sequence into a profile.
+ * This version correctly compares the old and new representatives to only insert
+ * newly added gaps, preventing alignment corruption.
+ */
+void projectGaps(const std::string &oldc, const std::string &newc, std::vector<std::string> &seqs) {
+    if (seqs.empty()) return;
+
+    size_t old_idx = 0;
+    for (size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
+        // Check if the character in the new sequence corresponds to a character from the old one
+        if (old_idx < oldc.size() && newc[new_idx] == oldc[old_idx]) {
+            old_idx++; // It's a character from the old sequence, just advance the pointer.
         } else {
-            ++idx_old;
+            // This is a new gap that was inserted.
+            // Insert a column of gaps into the profile at this new position.
+            for (auto &s : seqs) {
+                s.insert(s.begin() + new_idx, '-');
+            }
         }
     }
 }
@@ -379,6 +493,121 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
         }
     }
     return tree;
+}
+
+/**
+ * @brief A single "worker" function that attempts to improve an MSA for a set number of iterations.
+ * This function is designed to be called in parallel. It starts with an initial MSA and
+ * returns the best one it could find in its allotted iterations.
+ *
+ * @param initial_msa The starting MSA for this worker.
+ * @param iterations The number of random splits/realigns to attempt.
+ * @param mode The sequence mode (DNA or Protein).
+ * @param fn The scoring function to use.
+ * @param g A reference to a seeded random number generator.
+ * @return The best MSA found by this worker.
+ */
+std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa, int iterations, ScoreMode mode, ScoreFn fn, std::mt19937& g) {
+    // A profile with 2 or fewer sequences cannot be split and refined.
+    if (initial_msa.size() <= 2) {
+        return initial_msa;
+    }
+
+    std::vector<std::string> best_msa = initial_msa;
+    long long best_score = calculate_sp_score(best_msa, mode, fn);
+
+    // Create a vector of indices [0, 1, 2, ...] to shuffle for random splitting.
+    std::vector<int> indices(initial_msa.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    // Main refinement loop for this worker
+    for (int i = 0; i < iterations; ++i) {
+        // Shuffle the indices to create a random partition
+        std::shuffle(indices.begin(), indices.end(), g);
+
+        // 1. Split the current best alignment into two random, non-empty profiles (A and B)
+        std::vector<std::string> profileA, profileB;
+        int split_point = initial_msa.size() / 2;
+        for (size_t j = 0; j < initial_msa.size(); ++j) {
+            if (j < split_point) {
+                profileA.push_back(best_msa[indices[j]]);
+            } else {
+                profileB.push_back(best_msa[indices[j]]);
+            }
+        }
+
+        // 2. Re-align the two profiles by aligning their consensus sequences
+        std::string repA = generate_consensus(profileA);
+        std::string repB = generate_consensus(profileB);
+
+        std::string aligned_repA, aligned_repB;
+        computeGlobalAlignment(repA, repB, mode, fn, aligned_repA, aligned_repB);
+
+        // 3. Project the newly introduced gaps back into the full profiles
+        projectGaps(repA, aligned_repA, profileA);
+        projectGaps(repB, aligned_repB, profileB);
+
+        // 4. Merge the realigned profiles to create the new candidate MSA
+        std::vector<std::string> new_msa = profileA;
+        new_msa.insert(new_msa.end(), profileB.begin(), profileB.end());
+
+        // 5. If the new alignment has a better score, adopt it as the new best
+        long long new_score = calculate_sp_score(new_msa, mode, fn);
+        if (new_score > best_score) {
+            best_score = new_score;
+            best_msa = new_msa;
+
+            // This console output is preserved. It will show progress from individual threads.
+            // It's helpful for seeing how active the search is.
+            #pragma omp critical
+            {
+                std::cout << "  Thread " << omp_get_thread_num()
+                          << " found a better score: " << best_score << std::endl;
+            }
+        }
+    }
+    // Return the best alignment this specific worker was able to find.
+    return best_msa;
+}
+
+/**
+ * @brief Performs iterative refinement in parallel using multiple threads.
+ */
+std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int rounds, int iterations_per_round, ScoreMode mode, ScoreFn fn) {
+    std::vector<std::string> global_best_msa = initial_msa;
+    long long global_best_score = calculate_sp_score(global_best_msa, mode, fn);
+    std::cout << "Initial MSA score: " << global_best_score << std::endl;
+
+    for (int r = 0; r < rounds; ++r) {
+        std::cout << "\n--- Starting Refinement Round " << r + 1 << "/" << rounds
+                  << " (Best score so far: " << global_best_score << ") ---" << std::endl;
+
+        int num_threads = omp_get_max_threads();
+        std::vector<std::vector<std::string>> thread_results(num_threads);
+
+        #pragma omp parallel
+        {
+            int thread_id = omp_get_thread_num();
+            // Each thread gets its own random number generator, seeded uniquely
+            std::mt19937 g(std::random_device{}() + thread_id);
+
+            // Each thread starts from the current global best and runs its own refinement search
+            thread_results[thread_id] = refine_msa_worker(global_best_msa, iterations_per_round, mode, fn, g);
+        } // All threads finish and synchronize here
+
+        // Now, back in serial, let's check the results from all threads
+        for (int i = 0; i < num_threads; ++i) {
+            long long thread_score = calculate_sp_score(thread_results[i], mode, fn);
+            if (thread_score > global_best_score) {
+                std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better score: " << thread_score << std::endl;
+                global_best_score = thread_score;
+                global_best_msa = thread_results[i];
+            }
+        }
+    }
+
+    std::cout << "\nFinished parallel refinement. Final score: " << global_best_score << std::endl;
+    return global_best_msa;
 }
 
 /** print MSA with block positions rather than headers **/
@@ -571,9 +800,9 @@ build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
     }
 
     // Case 3: The node is binary. Align the two child profiles (A and B).
-    // Pick a "representative" string from each profile to align.
-    std::string consA = A[0];
-    std::string consB = B[0];
+    // Generate a consensus sequence to represent each profile.
+    std::string consA = generate_consensus(A);
+    std::string consB = generate_consensus(B);
 
     // Align the representative strings.
     std::string aligned_consA, aligned_consB;
@@ -591,6 +820,90 @@ build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
 
     n->profile = std::move(M);
     return n->profile;
+}
+
+// A simple struct to hold the results of our search
+struct GapSearchResult {
+    long long score = -__LONG_LONG_MAX__;
+    double gap_open = 0.0;
+    double gap_extend = 0.0;
+};
+
+/**
+ * @brief Performs a parallel grid search to find the optimal gap penalties for a set of sequences.
+ */
+GapSearchResult find_optimal_gap_penalties(
+    const std::vector<std::string>& initial_seqs,
+    const std::vector<std::string>& initial_hdrs,
+    ScoreMode mode,
+    ScoreFn fn)
+{
+    std::cout << "\n--- Starting parallel search for optimal gap penalties ---" << std::endl;
+
+    // 1. Define the grid of parameters to search
+    std::vector<double> open_penalties;
+    for (double o = -25.0; o <= -10.0; o += 2.5) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
+
+    std::vector<double> extend_penalties;
+    for (double e = -5.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
+
+    std::vector<GapSearchResult> results(open_penalties.size() * extend_penalties.size());
+
+    // 2. Perform the grid search in parallel
+    // The collapse(2) clause maps the nested loops to a single parallel loop.
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int i = 0; i < open_penalties.size(); ++i) {
+        for (int j = 0; j < extend_penalties.size(); ++j) {
+            // Each thread works with its own private copy of the gap penalties
+            GAP_OPEN = open_penalties[i];
+            GAP_EXTEND = extend_penalties[j];
+
+            // 3. For each parameter set, build a complete initial MSA from scratch
+            // Note: We are NOT passing gap penalties as arguments, because they are threadprivate
+            auto D = computeDistanceMatrix(initial_seqs, mode, fn);
+            auto nwk = buildUPGMATree(D, initial_hdrs);
+            Node* root = parseNewick(nwk, initial_hdrs);
+
+            // Seed the leaves of the tree
+            std::queue<Node*> q;
+            if (root) q.push(root);
+            while(!q.empty()) {
+                Node* u = q.front(); q.pop();
+                if (!u) continue;
+                if (u->leaf) u->profile = { initial_seqs[u->seq_index] };
+                else {
+                    if (u->left) q.push(u->left);
+                    if (u->right) q.push(u->right);
+                }
+            }
+
+            // Build the MSA and calculate its score
+            auto msa = build_profile(root, mode, fn);
+            long long score = calculate_sp_score(msa, mode, fn);
+
+            // Store the result
+            int index = i * extend_penalties.size() + j;
+            results[index] = {score, GAP_OPEN, GAP_EXTEND};
+
+            #pragma omp critical
+            {
+                std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << "). Score: " << score << std::endl;
+            }
+
+            // A more complete implementation would free the memory allocated by parseNewick here.
+        }
+    }
+
+    // 4. Find the best result from all the parallel tasks
+    GapSearchResult best_result;
+    for (const auto& result : results) {
+        if (result.score > best_result.score) {
+            best_result = result;
+        }
+    }
+
+    std::cout << "--- Finished parameter search ---" << std::endl;
+    return best_result;
 }
 
 int main(int argc, char** argv) {
@@ -664,7 +977,15 @@ int main(int argc, char** argv) {
     std::vector<std::string> hdrs(n), seqs(n);
     for (int i = 0; i < n; ++i) {
         processFasta(files[i], hdrs[i], seqs[i]);
+        sanitize_header(hdrs[i]);
     }
+
+    // --- ADDED: Find Optimal Gap Penalties before proceeding ---
+    auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
+    GAP_OPEN = best_params.gap_open;
+    GAP_EXTEND = best_params.gap_extend;
+    std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN << ", GAP_EXTEND=" << GAP_EXTEND
+              << " with score: " << best_params.score << "\n" << std::endl;
 
     // 5) Simplify headers
     for (int i = 0; i < n; ++i) {
@@ -718,30 +1039,11 @@ int main(int argc, char** argv) {
     //    recursively build the full MSA
     auto msa = build_profile(root, mode, fn);
 
-    // 8) Pad to uniform length
-    size_t L = 0;
-    for (auto &s : msa) L = std::max(L, s.size());
-    for (auto &s : msa) if (s.size()<L) s.append(L - s.size(), '-');
-
-    // 9) Compute sum‐of‐pairs score
-    long long msa_score = 0;
-    int m = msa.size();
-    for (size_t j = 0; j < L; ++j) {
-        for (int i = 0; i < m; ++i) {
-            for (int k = i+1; k < m; ++k) {
-                char a = msa[i][j], b = msa[k][j];
-                if (a!='-' && b!='-')
-                    msa_score += score(a,b,mode);
-                else if ((a=='-') ^ (b=='-'))
-                    msa_score += (long long)GAP_OPEN;
-            }
-        }
-    }
-    std::cout << "\nMSA sum-of-pairs score: " << msa_score << "\n";
-    double avg_col  = double(msa_score)/L;
-    double avg_pair = double(msa_score)/(L * (m*(m-1)/2));
-    std::cout << "avg per column = " << avg_col
-              << ", avg per pair = "  << avg_pair << "\n\n";
+    // --- ADDED PARALLEL REFINEMENT STEP ---
+    // Refine the MSA using multiple threads over several rounds
+    int total_rounds = 3;
+    int iterations_per_thread_per_round = 100; // Total work = rounds * iterations * num_threads
+    msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn);
 
     // 10) Print colored MSA
     printColorMSA(msa);
