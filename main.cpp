@@ -254,12 +254,15 @@ int computeGlobalAlignment(const std::string &x,
 }
 
 /**
- * @brief Replaces characters in a header that can interfere with parsing, like spaces.
+ * @brief Replaces characters in a header that can interfere with parsing.
+ * This version replaces ALL whitespace (spaces, tabs, etc.) with underscores.
  */
 void sanitize_header(std::string& header) {
-    // Replace spaces with underscores. Spaces are common culprits in breaking
-    // formats like Newick.
-    std::replace(header.begin(), header.end(), ' ', '_');
+    for (char &c : header) {
+        if (isspace(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
 }
 
 /** read first FASTA record, uppercase & strip non‐letters **/
@@ -842,10 +845,10 @@ GapSearchResult find_optimal_gap_penalties(
 
     // 1. Define the grid of parameters to search
     std::vector<double> open_penalties;
-    for (double o = -25.0; o <= -10.0; o += 2.5) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
+    for (double o = -25.0; o <= -1.0; o += 1.0) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
 
     std::vector<double> extend_penalties;
-    for (double e = -5.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
+    for (double e = -25.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
 
     std::vector<GapSearchResult> results(open_penalties.size() * extend_penalties.size());
 
@@ -972,13 +975,32 @@ int main(int argc, char** argv) {
         files.emplace_back(argv[argi]);
     }
 
-    // 4) Read sequences
+    // 4) Read and Finalize Headers
     int n = files.size();
     std::vector<std::string> hdrs(n), seqs(n);
     for (int i = 0; i < n; ++i) {
         processFasta(files[i], hdrs[i], seqs[i]);
+
+        // First, sanitize all whitespace to underscores
         sanitize_header(hdrs[i]);
+
+        // Second, simplify the header to its final form
+        if (mode == MODE_PROTEIN) {
+            auto &h = hdrs[i];
+            size_t p1 = h.find('|');
+            size_t p2 = (p1==std::string::npos ? std::string::npos : h.find('|',p1+1));
+            if (p1!=std::string::npos && p2!=std::string::npos)
+                hdrs[i] = h.substr(p1+1, p2-p1-1);
+        } else { // DNA mode
+            auto &h = hdrs[i];
+            // Since spaces are now underscores, we simplify by taking the part before the first underscore.
+            size_t sp = h.find('_');
+            if (sp != std::string::npos) {
+                hdrs[i] = h.substr(0, sp);
+            }
+        }
     }
+
 
     // --- ADDED: Find Optimal Gap Penalties before proceeding ---
     auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
