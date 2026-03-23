@@ -18,7 +18,7 @@ set(PERF_FLAGS
 
 # add your executable
 add_executable(msalign
-        main.cpp
+        src/main.cpp
 )
 
 # apply PERF_FLAGS just to this target

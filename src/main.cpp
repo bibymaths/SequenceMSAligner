@@ -7,79 +7,96 @@
  * Author: Abhinav Mishra
  */
 
-#include <iomanip>
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <string>
-#include <algorithm>
-#include <cmath>
-#include <filesystem>
-#include <stdexcept>
-#include <climits>
-#include <array>
-#include <set>
 #include <immintrin.h>
 #include <omp.h>
-#include <queue>
-#include <tuple>
-#include <stack>
+
+#include <algorithm>
+#include <array>
 #include <cctype>
+#include <climits>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <queue>
 #include <random>
+#include <set>
+#include <sstream>
+#include <stack>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
 #include "EDNAFULL.h"
 #include "EBLOSUM62.h"
 
 // ANSI color codes
 #define RESET "\033[0m"
 #define GREEN "\033[32m"
-#define RED   "\033[31m"
-#define CYAN  "\033[36m"
+#define RED "\033[31m"
+#define CYAN "\033[36m"
 
 // Gap penalties
 // Use mutable variables
-double GAP_OPEN   = -5.0;
-double GAP_EXTEND = -1.0;
+double GAP_OPEN = 0;
+double GAP_EXTEND = 0;
 static const int LINE_WIDTH = 80;
 
 // Scoring modes
 enum ScoreMode { MODE_DNA, MODE_PROTEIN };
-using ScoreFn = int(*)(char,char);
+using ScoreFn = int (*)(char, char);
 
 // DNA / EDNAFULL lookup
-static const std::array<uint8_t,256> char2idx = [](){
-    std::array<uint8_t,256> m{}; m.fill(255);
-    m['A']=0; m['C']=1; m['G']=2; m['T']=3; m['U']=3;
-    m['R']=4; m['Y']=5; m['S']=6; m['W']=7;
-    m['K']=8; m['M']=9; m['B']=10; m['D']=11;
-    m['H']=12; m['V']=13; m['N']=14; m['X']=14;
+static const std::array<uint8_t, 256> char2idx = []() {
+    std::array<uint8_t, 256> m{};
+    m.fill(255);
+    m['A'] = 0;
+    m['C'] = 1;
+    m['G'] = 2;
+    m['T'] = 3;
+    m['U'] = 3;
+    m['R'] = 4;
+    m['Y'] = 5;
+    m['S'] = 6;
+    m['W'] = 7;
+    m['K'] = 8;
+    m['M'] = 9;
+    m['B'] = 10;
+    m['D'] = 11;
+    m['H'] = 12;
+    m['V'] = 13;
+    m['N'] = 14;
+    m['X'] = 14;
     return m;
 }();
 
 // Protein / BLOSUM62 lookup
-static const std::array<uint8_t,256> prot_idx = [](){
-    std::array<uint8_t,256> m{}; m.fill(255);
-    const char* AA="ARNDCQEGHILKMFPSTWYVBZX*";
-    for(int i=0; AA[i]; ++i) m[(uint8_t)AA[i]] = i;
+static const std::array<uint8_t, 256> prot_idx = []() {
+    std::array<uint8_t, 256> m{};
+    m.fill(255);
+    const char* AA = "ARNDCQEGHILKMFPSTWYVBZX*";
+    for (int i = 0; AA[i]; ++i) m[(uint8_t)AA[i]] = i;
     return m;
 }();
 
 /**
-* @brief Computes the BLOSUM62 score for a pair of amino acids.
-* This function maps characters to their corresponding indices in the BLOSUM62 matrix
-* and returns the score for the pair.
-*
-* @param x The first amino acid character.
-* @param y The second amino acid character.
-* @return The BLOSUM62 score for the pair.
-*/
+ * @brief Computes the BLOSUM62 score for a pair of amino acids.
+ * This function maps characters to their corresponding indices in the BLOSUM62 matrix
+ * and returns the score for the pair.
+ *
+ * @param x The first amino acid character.
+ * @param y The second amino acid character.
+ * @return The BLOSUM62 score for the pair.
+ */
 inline int blosum62_score(char x, char y) {
     // map to uppercase in case it slipped through
     x = static_cast<char>(std::toupper((unsigned char)x));
     y = static_cast<char>(std::toupper((unsigned char)y));
 
     uint8_t ix = prot_idx[static_cast<uint8_t>(x)];
-    if (ix == 255) ix = prot_idx['X'];         // unknown → X
+    if (ix == 255) ix = prot_idx['X'];  // unknown → X
     uint8_t iy = prot_idx[static_cast<uint8_t>(y)];
     if (iy == 255) iy = prot_idx['X'];
 
@@ -87,19 +104,20 @@ inline int blosum62_score(char x, char y) {
 }
 
 /**
-* @brief Computes the score for a pair of characters using the appropriate scoring matrix.
-* This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein sequences.
-*
-* @param x The first character.
-* @param y The second character.
-* @return The score for the character pair.
-*/
+ * @brief Computes the score for a pair of characters using the appropriate scoring matrix.
+ * This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein
+ * sequences.
+ *
+ * @param x The first character.
+ * @param y The second character.
+ * @return The score for the character pair.
+ */
 inline int edna_score(char x, char y) {
     x = static_cast<char>(std::toupper((unsigned char)x));
     y = static_cast<char>(std::toupper((unsigned char)y));
 
     uint8_t ix = char2idx[static_cast<uint8_t>(x)];
-    if (ix == 255) ix = char2idx['N'];         // unknown → N
+    if (ix == 255) ix = char2idx['N'];  // unknown → N
     uint8_t iy = char2idx[static_cast<uint8_t>(y)];
     if (iy == 255) iy = char2idx['N'];
 
@@ -108,15 +126,16 @@ inline int edna_score(char x, char y) {
 
 /**
  * @brief Computes the score for a pair of characters based on the specified scoring mode.
- * This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein sequences.
+ * This function uses the EDNAFULL matrix for DNA sequences and the BLOSUM62 matrix for protein
+ * sequences.
  *
  * @param x The first character.
  * @param y The second character.
  * @param mode The scoring mode (DNA or Protein).
  * @return The score for the character pair.
  */
-inline int score(char x,char y,ScoreMode mode){
-    return mode==MODE_DNA ? edna_score(x,y) : blosum62_score(x,y);
+inline int score(char x, char y, ScoreMode mode) {
+    return mode == MODE_DNA ? edna_score(x, y) : blosum62_score(x, y);
 }
 
 /**
@@ -131,13 +150,8 @@ inline int score(char x,char y,ScoreMode mode){
  * @param aligned_y Output string for the aligned second sequence.
  * @return The final alignment score.
  */
-int computeGlobalAlignment(const std::string &x,
-                           const std::string &y,
-                           ScoreMode mode,
-                           ScoreFn score_fn,
-                           std::string &aligned_x,
-                           std::string &aligned_y)
-{
+int computeGlobalAlignment(const std::string& x, const std::string& y, ScoreMode mode,
+                           ScoreFn score_fn, std::string& aligned_x, std::string& aligned_y) {
     const int m = x.size();
     const int n = y.size();
 
@@ -145,81 +159,74 @@ int computeGlobalAlignment(const std::string &x,
     int n8 = (n + 7) & ~7;
 
     // Allocate aligned buffers of length n8+1
-    std::vector<int> S_prev(n8+1), S_cur(n8+1);
-    std::vector<int> E_cur(n8+1), F_prev(n8+1);
-    std::vector<char> trace_buf((m+1)*(n+1));
+    std::vector<int> S_prev(n8 + 1), S_cur(n8 + 1);
+    std::vector<int> E_cur(n8 + 1), F_prev(n8 + 1);
+    std::vector<char> trace_buf((m + 1) * (n + 1));
 
-    const __m256i vGapOpen   = _mm256_set1_epi32(int(GAP_OPEN));
+    const __m256i vGapOpen = _mm256_set1_epi32(int(GAP_OPEN));
     const __m256i vGapExtend = _mm256_set1_epi32(int(GAP_EXTEND));
 
     // init row 0
     S_prev[0] = 0;
-    for(int j = 1; j <= n; ++j) {
-        int e = (j==1 ? S_prev[j-1] + GAP_OPEN : E_cur[j-1] + GAP_EXTEND);
+    for (int j = 1; j <= n; ++j) {
+        int e = (j == 1 ? S_prev[j - 1] + GAP_OPEN : E_cur[j - 1] + GAP_EXTEND);
         S_prev[j] = e;
-        E_cur[j]  = e;
-        F_prev[j] = INT_MIN/2;
-        trace_buf[j] = (j==1 ? 'E' : 'e');
+        E_cur[j] = e;
+        F_prev[j] = INT_MIN / 2;
+        trace_buf[j] = (j == 1 ? 'E' : 'e');
     }
     // pad to n8
-    for(int j = n+1; j <= n8; ++j) {
-        S_prev[j] = INT_MIN/2;
-        E_cur[j]  = INT_MIN/2;
-        F_prev[j] = INT_MIN/2;
+    for (int j = n + 1; j <= n8; ++j) {
+        S_prev[j] = INT_MIN / 2;
+        E_cur[j] = INT_MIN / 2;
+        F_prev[j] = INT_MIN / 2;
     }
 
     // temp arrays for vector loads/stores
-    int *Sp  = S_prev.data();
-    int *Sc  = S_cur.data();
-    int *Ec  = E_cur.data();
-    int *Fp  = F_prev.data();
+    int* Sp = S_prev.data();
+    int* Sc = S_cur.data();
+    int* Ec = E_cur.data();
+    int* Fp = F_prev.data();
 
-    for(int i = 1; i <= m; ++i) {
+    for (int i = 1; i <= m; ++i) {
         // scalar first column
         int openF = Sp[0] + GAP_OPEN;
-        int extF  = Fp[0] + GAP_EXTEND;
+        int extF = Fp[0] + GAP_EXTEND;
         Sc[0] = std::max(openF, extF);
-        Ec[0] = INT_MIN/2;
+        Ec[0] = INT_MIN / 2;
         Fp[0] = Sc[0];
-        trace_buf[i*(n+1) + 0] = (Sc[0] == openF ? 'F' : 'f');
+        trace_buf[i * (n + 1) + 0] = (Sc[0] == openF ? 'F' : 'f');
 
         // broadcast S_prev[i-1][j-1] lanewise
         __m256i vSdiag = _mm256_set1_epi32(Sp[0]);
 
         // vectorized inner loop: j=1..n8 step 8
-        for(int j = 1; j <= n8; j += 8) {
+        for (int j = 1; j <= n8; j += 8) {
             // load previous vectors
-            __m256i vSp   = _mm256_loadu_si256((__m256i*)&Sp[j]);
-            __m256i vFp   = _mm256_loadu_si256((__m256i*)&Fp[j]);
-            __m256i vEc   = _mm256_loadu_si256((__m256i*)&Ec[j-1]); // note shift for E
-            __m256i vScm1 = _mm256_loadu_si256((__m256i*)&Sc[j-1]); // current S[j-1]
+            __m256i vSp = _mm256_loadu_si256((__m256i*)&Sp[j]);
+            __m256i vFp = _mm256_loadu_si256((__m256i*)&Fp[j]);
+            __m256i vEc = _mm256_loadu_si256((__m256i*)&Ec[j - 1]);    // note shift for E
+            __m256i vScm1 = _mm256_loadu_si256((__m256i*)&Sc[j - 1]);  // current S[j-1]
 
             // compute F = max(S_prev + gapOpen, F_prev + gapExtend)
-            __m256i vF = _mm256_max_epi32(
-                _mm256_add_epi32(vSp, vGapOpen),
-                _mm256_add_epi32(vFp, vGapExtend)
-            );
+            __m256i vF = _mm256_max_epi32(_mm256_add_epi32(vSp, vGapOpen),
+                                          _mm256_add_epi32(vFp, vGapExtend));
 
             // compute E = max(S_cur[j-1] + gapOpen, E_cur[j-1] + gapExtend)
-            __m256i vE = _mm256_max_epi32(
-                _mm256_add_epi32(vScm1, vGapOpen),
-                _mm256_add_epi32(vEc,   vGapExtend)
-            );
+            __m256i vE = _mm256_max_epi32(_mm256_add_epi32(vScm1, vGapOpen),
+                                          _mm256_add_epi32(vEc, vGapExtend));
 
             // build vSdiag: prev_S[j-1], prev_F[j-1], prev_E[j-1]
-            __m256i vFp_shift = _mm256_loadu_si256((__m256i*)&Fp[j-1]);
-            __m256i vEp_shift = _mm256_loadu_si256((__m256i*)&Ec[j-1]);
-            __m256i vBestPrev = _mm256_max_epi32(
-                _mm256_max_epi32(vSdiag, vFp_shift),
-                vEp_shift
-            );
+            __m256i vFp_shift = _mm256_loadu_si256((__m256i*)&Fp[j - 1]);
+            __m256i vEp_shift = _mm256_loadu_si256((__m256i*)&Ec[j - 1]);
+            __m256i vBestPrev = _mm256_max_epi32(_mm256_max_epi32(vSdiag, vFp_shift), vEp_shift);
 
             // compute match/mismatch scores vector
             int scores[8];
-            for(int k=0; k<8; ++k) {
-                int idx = j+k-1;
+            for (int k = 0; k < 8; ++k) {
+                int idx = j + k - 1;
                 int sc = 0;
-                if (idx < n) sc = score_fn(x[i-1], y[idx]);
+                if (idx < n) sc = score_fn(x[i - 1], y[idx]);
                 scores[k] = sc;
             }
             __m256i vMatch = _mm256_loadu_si256((__m256i*)scores);
@@ -228,10 +235,7 @@ int computeGlobalAlignment(const std::string &x,
             __m256i vM = _mm256_add_epi32(vBestPrev, vMatch);
 
             // S = max(M, E, F)
-            __m256i vS = _mm256_max_epi32(
-                _mm256_max_epi32(vM, vE),
-                vF
-            );
+            __m256i vS = _mm256_max_epi32(_mm256_max_epi32(vM, vE), vF);
 
             // store results
             _mm256_storeu_si256((__m256i*)&Sc[j], vS);
@@ -246,17 +250,17 @@ int computeGlobalAlignment(const std::string &x,
             _mm256_storeu_si256((__m256i*)Sblock, vS);
             _mm256_storeu_si256((__m256i*)Eblock, vE);
             _mm256_storeu_si256((__m256i*)Fblock, vF);
-            for(int k=0; k<8; ++k) {
-                if (j+k <= n) {
-                    char ptr = 'M'; // Default to Match
+            for (int k = 0; k < 8; ++k) {
+                if (j + k <= n) {
+                    char ptr = 'M';  // Default to Match
                     // The highest score determines the path.
                     // avoids the out-of-bounds read.
                     if (Sblock[k] == Eblock[k]) {
-                        ptr = 'E'; // Gap in sequence X (Insertion)
+                        ptr = 'E';  // Gap in sequence X (Insertion)
                     } else if (Sblock[k] == Fblock[k]) {
-                        ptr = 'F'; // Gap in sequence Y (Deletion)
+                        ptr = 'F';  // Gap in sequence Y (Deletion)
                     }
-                    trace_buf[i*(n+1) + (j+k)] = ptr;
+                    trace_buf[i * (n + 1) + (j + k)] = ptr;
                 }
             }
         }
@@ -274,13 +278,30 @@ int computeGlobalAlignment(const std::string &x,
     aligned_y.clear();
     int i = m, j = n;
     while (i > 0 || j > 0) {
-        char p = trace_buf[i*(n+1) + j];
-        if      (p == 'M') { aligned_x.push_back(x[i-1]); aligned_y.push_back(y[j-1]); --i; --j; }
-        else if (p=='F'||p=='f') { aligned_x.push_back(x[i-1]); aligned_y.push_back('-'); --i; }
-        else if (p=='E'||p=='e') { aligned_x.push_back('-'); aligned_y.push_back(y[j-1]); --j; }
-        else {
-            if (i>0) { aligned_x.push_back(x[i-1]); aligned_y.push_back('-'); --i; }
-            else     { aligned_x.push_back('-'); aligned_y.push_back(y[j-1]); --j; }
+        char p = trace_buf[i * (n + 1) + j];
+        if (p == 'M') {
+            aligned_x.push_back(x[i - 1]);
+            aligned_y.push_back(y[j - 1]);
+            --i;
+            --j;
+        } else if (p == 'F' || p == 'f') {
+            aligned_x.push_back(x[i - 1]);
+            aligned_y.push_back('-');
+            --i;
+        } else if (p == 'E' || p == 'e') {
+            aligned_x.push_back('-');
+            aligned_y.push_back(y[j - 1]);
+            --j;
+        } else {
+            if (i > 0) {
+                aligned_x.push_back(x[i - 1]);
+                aligned_y.push_back('-');
+                --i;
+            } else {
+                aligned_x.push_back('-');
+                aligned_y.push_back(y[j - 1]);
+                --j;
+            }
         }
     }
     std::reverse(aligned_x.begin(), aligned_x.end());
@@ -293,7 +314,7 @@ int computeGlobalAlignment(const std::string &x,
  * @param header The header string to sanitize.
  */
 void sanitize_header(std::string& header) {
-    for (char &c : header) {
+    for (char& c : header) {
         if (isspace(static_cast<unsigned char>(c))) {
             c = '_';
         }
@@ -309,7 +330,7 @@ void sanitize_header(std::string& header) {
  * @param hdr Output parameter for the header (without '>' prefix).
  * @param seq Output parameter for the sequence (uppercase, no gaps).
  */
-void processFasta(const std::string &fn, std::string &hdr, std::string &seq) {
+void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
     std::ifstream f(fn);
     if (!f) throw std::runtime_error("Cannot open " + fn);
     hdr.clear();
@@ -352,7 +373,7 @@ std::string generate_consensus(const std::vector<std::string>& profile) {
     int num_seqs = profile.size();
 
     for (int j = 0; j < align_len; ++j) {
-        std::array<int, 256> counts{}; // Initialize all counts to 0
+        std::array<int, 256> counts{};  // Initialize all counts to 0
         int max_count = 0;
         char best_char = '-';
 
@@ -386,7 +407,6 @@ long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode
     // Iterate over every unique pair of sequences in the alignment (i and k)
     for (int i = 0; i < num_seqs; ++i) {
         for (int k = i + 1; k < num_seqs; ++k) {
-
             // For each pair, we must track the gap state independently.
             // A gap between seqs i and k is independent of a gap between i and j.
             bool in_gap_for_this_pair = false;
@@ -401,9 +421,9 @@ long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode
                     // --- Case 1: Residue vs Residue ---
                     // This is a standard match/mismatch.
                     total_score += score(char_i, char_k, mode);
-                    in_gap_for_this_pair = false; // The gap (if any) has ended.
+                    in_gap_for_this_pair = false;  // The gap (if any) has ended.
 
-                } else if (char_i != char_k) { // This condition is true only for Residue vs Gap
+                } else if (char_i != char_k) {  // This condition is true only for Residue vs Gap
                     // --- Case 2: Residue vs Gap ---
                     if (in_gap_for_this_pair) {
                         // We are already in a gap, so this is an extension.
@@ -413,7 +433,7 @@ long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode
                         // Apply both the open and the first extend penalty.
                         total_score += (long long)GAP_OPEN + (long long)GAP_EXTEND;
                     }
-                    in_gap_for_this_pair = true; // We are now in a gap state.
+                    in_gap_for_this_pair = true;  // We are now in a gap state.
 
                 } else {
                     // --- Case 3: Gap vs Gap ---
@@ -427,24 +447,23 @@ long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode
     return total_score;
 }
 
-
 /**
  * @brief Projects gaps from a newly aligned representative sequence into a profile.
  * This version correctly compares the old and new representatives to only insert
  * newly added gaps, preventing alignment corruption.
  */
-void projectGaps(const std::string &oldc, const std::string &newc, std::vector<std::string> &seqs) {
+void projectGaps(const std::string& oldc, const std::string& newc, std::vector<std::string>& seqs) {
     if (seqs.empty()) return;
 
     size_t old_idx = 0;
     for (size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
         // Check if the character in the new sequence corresponds to a character from the old one
         if (old_idx < oldc.size() && newc[new_idx] == oldc[old_idx]) {
-            old_idx++; // advance the pointer.
+            old_idx++;  // advance the pointer.
         } else {
             // This is a new gap that was inserted.
             // Insert a column of gaps into the profile at this new position.
-            for (auto &s : seqs) {
+            for (auto& s : seqs) {
                 s.insert(s.begin() + new_idx, '-');
             }
         }
@@ -454,16 +473,14 @@ void projectGaps(const std::string &oldc, const std::string &newc, std::vector<s
 /**
  * @brief Compute identity‐based distance matrix in parallel.
  */
-std::vector<std::vector<double>>
-computeDistanceMatrix(const std::vector<std::string>& seqs,
-                      ScoreMode mode, ScoreFn fn)
-{
+std::vector<std::vector<double>> computeDistanceMatrix(const std::vector<std::string>& seqs,
+                                                       ScoreMode mode, ScoreFn fn) {
     size_t n = seqs.size();
     std::vector<std::vector<double>> D(n, std::vector<double>(n, 0.0));
 
 #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < (int)n; ++i) {
-        for (int j = i+1; j < (int)n; ++j) {
+        for (int j = i + 1; j < (int)n; ++j) {
             std::string ax, ay;
             computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay);
             int L = ax.size(), match = 0;
@@ -471,7 +488,7 @@ computeDistanceMatrix(const std::vector<std::string>& seqs,
             for (int k = 0; k < L; ++k) {
                 if (ax[k] == ay[k] && ax[k] != '-') ++match;
             }
-            double identity = (L>0 ? double(match)/L : 0.0);
+            double identity = (L > 0 ? double(match) / L : 0.0);
             double dist = 1.0 - identity;
             D[i][j] = D[j][i] = dist;
         }
@@ -489,11 +506,10 @@ computeDistanceMatrix(const std::vector<std::string>& seqs,
  * @param outdir The directory where the output file will be saved.
  */
 void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
-                        const std::vector<std::string>& hdrs,
-                        const std::string& outdir)
-{
+                        const std::vector<std::string>& hdrs, const std::string& outdir) {
     if (D.empty() || D.size() != hdrs.size()) {
-        std::cerr << "Warning: Cannot save identity matrix due to size mismatch or empty data." << std::endl;
+        std::cerr << "Warning: Cannot save identity matrix due to size mismatch or empty data."
+                  << std::endl;
         return;
     }
 
@@ -509,7 +525,7 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
 
     // Find the length of the longest header to format the output neatly
     size_t max_hdr_len = 0;
-    for(const auto& h : hdrs) {
+    for (const auto& h : hdrs) {
         if (h.length() > max_hdr_len) {
             max_hdr_len = h.length();
         }
@@ -522,8 +538,8 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
 
     for (size_t i = 0; i < n; ++i) {
         // Print the row number (e.g., "1:") and the left-aligned header
-        matrix_file << std::setw(5) << std::right << std::to_string(i + 1) + ":"
-                    << " " << std::setw(max_hdr_len) << std::left << hdrs[i];
+        matrix_file << std::setw(5) << std::right << std::to_string(i + 1) + ":" << " "
+                    << std::setw(max_hdr_len) << std::left << hdrs[i];
 
         // Print the identity values for the entire row
         for (size_t j = 0; j < n; ++j) {
@@ -550,37 +566,35 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
  * @param names Cluster labels (will be updated in place).
  * @return      Newick string.
  */
-std::string buildUPGMATree(std::vector<std::vector<double>> D,
-                           std::vector<std::string> names)
-{
+std::string buildUPGMATree(std::vector<std::vector<double>> D, std::vector<std::string> names) {
     int n = names.size();
-    struct Cluster { std::string nwk; int size; };
+    struct Cluster {
+        std::string nwk;
+        int size;
+    };
     std::vector<Cluster> C(n);
-    std::vector<bool> alive(n,true);
-    for (int i = 0; i < n; ++i) C[i] = { names[i], 1 };
+    std::vector<bool> alive(n, true);
+    for (int i = 0; i < n; ++i) C[i] = {names[i], 1};
 
     // Min‐heap of (distance, a, b)
-    using Entry = std::tuple<double,int,int>;
-    auto cmp = [](Entry const &a, Entry const &b){
-        return std::get<0>(a) > std::get<0>(b);
-    };
+    using Entry = std::tuple<double, int, int>;
+    auto cmp = [](Entry const& a, Entry const& b) { return std::get<0>(a) > std::get<0>(b); };
     std::priority_queue<Entry, std::vector<Entry>, decltype(cmp)> pq(cmp);
 
     // seed heap
     for (int i = 0; i < n; ++i)
-        for (int j = i+1; j < n; ++j)
-            pq.emplace(D[i][j], i, j);
+        for (int j = i + 1; j < n; ++j) pq.emplace(D[i][j], i, j);
 
     int remaining = n;
     while (remaining > 1) {
-        auto [d, a, b] = pq.top(); pq.pop();
+        auto [d, a, b] = pq.top();
+        pq.pop();
         if (!alive[a] || !alive[b]) continue;  // stale entry
 
         // merge b into a
         double half = d * 0.5;
         std::ostringstream nw;
-        nw << "(" << C[a].nwk << ":" << half
-           << "," << C[b].nwk << ":" << half << ")";
+        nw << "(" << C[a].nwk << ":" << half << "," << C[b].nwk << ":" << half << ")";
         C[a].nwk = nw.str();
         C[a].size += C[b].size;
         alive[b] = false;
@@ -590,8 +604,7 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
         for (int k = 0; k < n; ++k) {
             if (alive[k] && k != a) {
                 // weighted average
-                double dk = (D[a][k]*C[a].size + D[b][k]*C[b].size)
-                            / (C[a].size + C[b].size);
+                double dk = (D[a][k] * C[a].size + D[b][k] * C[b].size) / (C[a].size + C[b].size);
                 D[a][k] = D[k][a] = dk;
                 pq.emplace(dk, a, k);
             }
@@ -621,7 +634,8 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
  * @param g A reference to a seeded random number generator.
  * @return The best MSA found by this worker.
  */
-std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa, int iterations, ScoreMode mode, ScoreFn fn, std::mt19937& g) {
+std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa, int iterations,
+                                           ScoreMode mode, ScoreFn fn, std::mt19937& g) {
     // A profile with 2 or fewer sequences cannot be split and refined.
     if (initial_msa.size() <= 2) {
         return initial_msa;
@@ -687,7 +701,8 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
 /**
  * @brief Performs iterative refinement in parallel using multiple threads.
  */
-std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int rounds, int iterations_per_round, ScoreMode mode, ScoreFn fn) {
+std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int rounds,
+                                    int iterations_per_round, ScoreMode mode, ScoreFn fn) {
     std::vector<std::string> global_best_msa = initial_msa;
     long long global_best_score = calculate_sp_score(global_best_msa, mode, fn);
     std::cout << "Initial MSA score: " << global_best_score << std::endl;
@@ -699,33 +714,36 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int ro
         int num_threads = omp_get_max_threads();
         std::vector<std::vector<std::string>> thread_results(num_threads);
 
-        #pragma omp parallel
+#pragma omp parallel
         {
             int thread_id = omp_get_thread_num();
             // Each thread gets its own random number generator, seeded uniquely
             std::mt19937 g(std::random_device{}() + thread_id);
 
             // Each thread starts from the current global best and runs its own refinement search
-            thread_results[thread_id] = refine_msa_worker(global_best_msa, iterations_per_round, mode, fn, g);
-        } // All threads finish and synchronize here
+            thread_results[thread_id] =
+                refine_msa_worker(global_best_msa, iterations_per_round, mode, fn, g);
+        }  // All threads finish and synchronize here
 
         // Now, back in serial, let's check the results from all threads
         for (int i = 0; i < num_threads; ++i) {
             long long thread_score = calculate_sp_score(thread_results[i], mode, fn);
             if (thread_score > global_best_score) {
-                // std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better score: " << thread_score << std::endl;
+                // std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better
+                // score: " << thread_score << std::endl;
                 global_best_score = thread_score;
                 global_best_msa = thread_results[i];
             }
         }
     }
 
-    std::cout << "\nFinished Iterative refinement. Final score: " << global_best_score << "\n\n" << std::endl;
+    std::cout << "\nFinished Iterative refinement. Final score: " << global_best_score << "\n\n"
+              << std::endl;
     return global_best_msa;
 }
 
 /** print MSA with block positions rather than headers **/
-void printColorMSA(const std::vector<std::string> &aln) {
+void printColorMSA(const std::vector<std::string>& aln) {
     int m = aln.size();
     int L = static_cast<int>(aln[0].size());  // now all aln[i].size() == L
 
@@ -754,8 +772,7 @@ void printColorMSA(const std::vector<std::string> &aln) {
         // now print each sequence line:
         for (int i = 0; i < m; ++i) {
             // print “start–end” positions, padded to width 8
-            std::cout << std::setw(8) << block_start[i]
-                      << " ";
+            std::cout << std::setw(8) << block_start[i] << " ";
 
             // figure out column‐conservation for color
             for (int j = start; j < end; ++j) {
@@ -769,14 +786,16 @@ void printColorMSA(const std::vector<std::string> &aln) {
                     }
                 }
 
-                if (c == '-')        std::cout << RED << c << RESET;
-                else if (fullyConserved) std::cout << GREEN << c << RESET;
-                else                  std::cout << CYAN << c << RESET;
+                if (c == '-')
+                    std::cout << RED << c << RESET;
+                else if (fullyConserved)
+                    std::cout << GREEN << c << RESET;
+                else
+                    std::cout << CYAN << c << RESET;
             }
 
             // print end coordinate
-            std::cout << " " << std::setw(8) << block_end[i]
-                      << "\n";
+            std::cout << " " << std::setw(8) << block_end[i] << "\n";
         }
         std::cout << "\n";
     }
@@ -791,7 +810,8 @@ void printColorMSA(const std::vector<std::string> &aln) {
  * @param hdrs A vector of the original, finalized sequence headers (used for tooltips).
  * @param outdir The directory where the output HTML file will be saved.
  */
-void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std::string>& hdrs, const std::string& outdir) {
+void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std::string>& hdrs,
+                     const std::string& outdir) {
     if (aln.empty()) {
         std::cerr << "Warning: Cannot generate HTML for an empty alignment." << std::endl;
         return;
@@ -868,7 +888,8 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std:
             html_file << "<div class=\"line-container\">";
 
             // Layout: [Header] [Start Pos] [Sequence] [End Pos]
-            html_file << "<span class=\"header\" title=\"" << hdrs[i] << "\">" << hdrs[i] << "</span>"
+            html_file << "<span class=\"header\" title=\"" << hdrs[i] << "\">" << hdrs[i]
+                      << "</span>"
                       << "<span class=\"position\">" << block_start[i] << "</span>"
                       << "<span class=\"sequence-block\">";
 
@@ -884,16 +905,20 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std:
                         }
                     }
                 }
-                if (current_char == '-') { html_file << "<span class=\"gap\">-</span>"; }
-                else if (is_fully_conserved) { html_file << "<span class=\"conserved\">" << current_char << "</span>"; }
-                else { html_file << "<span class=\"residue\">" << current_char << "</span>"; }
+                if (current_char == '-') {
+                    html_file << "<span class=\"gap\">-</span>";
+                } else if (is_fully_conserved) {
+                    html_file << "<span class=\"conserved\">" << current_char << "</span>";
+                } else {
+                    html_file << "<span class=\"residue\">" << current_char << "</span>";
+                }
             }
-            html_file << "</span>"; // Close sequence-block
+            html_file << "</span>";  // Close sequence-block
 
             // Print the end position and close the line container
             html_file << "<span class=\"position\">" << block_end[i] << "</span></div>\n";
         }
-        html_file << "\n"; // Blank line between blocks
+        html_file << "\n";  // Blank line between blocks
     }
 
     // 3. Write HTML footer
@@ -915,20 +940,20 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std:
  * @param fn The scoring function to use.
  * @return A vector of aligned sequences.
  */
-std::vector<std::string> msa_star(const std::vector<std::string> &hdrs,
-                                  const std::vector<std::string> &seqs,
-                                  ScoreMode mode, ScoreFn fn)
-{
-    int n=seqs.size();
+std::vector<std::string> msa_star(const std::vector<std::string>& hdrs,
+                                  const std::vector<std::string>& seqs, ScoreMode mode,
+                                  ScoreFn fn) {
+    int n = seqs.size();
     std::vector<std::string> aligned(n);
-    std::string center = seqs[0]; aligned[0]=center;
-    for(int i=1;i<n;++i){
+    std::string center = seqs[0];
+    aligned[0] = center;
+    for (int i = 1; i < n; ++i) {
         std::string ac, as;
         computeGlobalAlignment(center, seqs[i], mode, fn, ac, as);
         // project
-        std::vector<std::string> prev(aligned.begin(), aligned.begin()+i);
+        std::vector<std::string> prev(aligned.begin(), aligned.begin() + i);
         projectGaps(center, ac, prev);
-        for(int k=0;k<i;++k) aligned[k]=prev[k];
+        for (int k = 0; k < i; ++k) aligned[k] = prev[k];
         aligned[i] = as;
         center = ac;
     }
@@ -937,10 +962,10 @@ std::vector<std::string> msa_star(const std::vector<std::string> &hdrs,
 
 // a tiny binary tree node for your guide‐tree
 struct Node {
-    bool              leaf;
-    int               seq_index;   // which original sequence, if leaf
-    std::vector<std::string> profile; // current MSA block under this node
-    Node             *left=nullptr, *right=nullptr;
+    bool leaf;
+    int seq_index;                     // which original sequence, if leaf
+    std::vector<std::string> profile;  // current MSA block under this node
+    Node *left = nullptr, *right = nullptr;
 };
 
 /**
@@ -961,7 +986,8 @@ Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names)
         }
         // This is a critical failure point. A name from the tree was not in the input file list.
         std::cerr << "\nFATAL PARSING ERROR: The name '" << name
-                  << "' from the guide tree was not found in the list of input sequence headers." << std::endl;
+                  << "' from the guide tree was not found in the list of input sequence headers."
+                  << std::endl;
         return -1;
     };
 
@@ -972,18 +998,21 @@ Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names)
     for (size_t i = 0; i < nwk.length(); ++i) {
         char c = nwk[i];
 
-        if (isspace(c)) continue; // Ignore whitespace
+        if (isspace(c)) continue;  // Ignore whitespace
 
         // Check for delimiters that end a text block (a name)
         if (c == ',' || c == ')' || c == ':' || c == ';') {
             if (!current_text.empty()) {
-                if (node_stack.empty()) { // Case for a single-node tree like "A;"
-                     root = new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
+                if (node_stack.empty()) {  // Case for a single-node tree like "A;"
+                    root = new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
                 } else {
                     Node* parent = node_stack.top();
-                    Node* leaf = new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
-                    if (parent->left == nullptr) parent->left = leaf;
-                    else parent->right = leaf;
+                    Node* leaf =
+                        new Node{true, find_name_index(current_text), {}, nullptr, nullptr};
+                    if (parent->left == nullptr)
+                        parent->left = leaf;
+                    else
+                        parent->right = leaf;
                 }
                 current_text.clear();
             }
@@ -992,7 +1021,8 @@ Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names)
                 if (!node_stack.empty()) node_stack.pop();
             } else if (c == ':') {
                 // Skip over the branch length that follows the colon
-                while (i + 1 < nwk.length() && (isdigit(nwk[i + 1]) || nwk[i + 1] == '.' || nwk[i + 1] == 'e' || nwk[i + 1] == '-')) {
+                while (i + 1 < nwk.length() && (isdigit(nwk[i + 1]) || nwk[i + 1] == '.' ||
+                                                nwk[i + 1] == 'e' || nwk[i + 1] == '-')) {
                     i++;
                 }
             }
@@ -1003,8 +1033,10 @@ Node* parseNewick(const std::string& nwk, const std::vector<std::string>& names)
             }
             if (!node_stack.empty()) {
                 Node* parent = node_stack.top();
-                if (parent->left == nullptr) parent->left = new_node;
-                else parent->right = new_node;
+                if (parent->left == nullptr)
+                    parent->left = new_node;
+                else
+                    parent->right = new_node;
             }
             node_stack.push(new_node);
         } else {
@@ -1029,11 +1061,12 @@ std::string formatNewickString(const std::string& nwk) {
 
     std::ostringstream formatted_tree;
     int indent_level = 0;
-    const std::string indent_unit = "    "; // Use 4 spaces for each indentation level
+    const std::string indent_unit = "    ";  // Use 4 spaces for each indentation level
 
     for (char c : nwk) {
         if (c == ')') {
-            // A closing parenthesis decreases indentation and moves to a new line before being printed.
+            // A closing parenthesis decreases indentation and moves to a new line before being
+            // printed.
             indent_level--;
             formatted_tree << "\n";
             for (int i = 0; i < indent_level; ++i) {
@@ -1045,7 +1078,8 @@ std::string formatNewickString(const std::string& nwk) {
         formatted_tree << c;
 
         if (c == '(') {
-            // An opening parenthesis increases indentation and starts a new line after being printed.
+            // An opening parenthesis increases indentation and starts a new line after being
+            // printed.
             indent_level++;
             formatted_tree << "\n";
             for (int i = 0; i < indent_level; ++i) {
@@ -1060,7 +1094,7 @@ std::string formatNewickString(const std::string& nwk) {
         }
     }
 
-    formatted_tree << "\n"; // Add a final newline for a clean file ending.
+    formatted_tree << "\n";  // Add a final newline for a clean file ending.
     return formatted_tree.str();
 }
 
@@ -1074,8 +1108,7 @@ std::string formatNewickString(const std::string& nwk) {
  * @param fn The scoring function to use.
  * @return A vector of aligned sequences representing the profile at this node.
  */
-std::vector<std::string>
-build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
+std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn) {
     // Safety check for null pointers passed from parent nodes
     if (!n) {
         return {};
@@ -1088,7 +1121,7 @@ build_profile(Node *n, ScoreMode mode, ScoreFn fn) {
     }
 
     // Recursively build the profiles for the children.
-    auto A = build_profile(n->left,  mode, fn);
+    auto A = build_profile(n->left, mode, fn);
     auto B = build_profile(n->right, mode, fn);
 
     // Case 2: The node is "unary" (has only one child profile).
@@ -1143,26 +1176,25 @@ struct GapSearchResult {
  * @param fn The scoring function to use.
  * @return A GapSearchResult containing the best score and corresponding gap penalties.
  */
-GapSearchResult find_optimal_gap_penalties(
-    const std::vector<std::string>& initial_seqs,
-    const std::vector<std::string>& initial_hdrs,
-    ScoreMode mode,
-    ScoreFn fn)
-{
+GapSearchResult find_optimal_gap_penalties(const std::vector<std::string>& initial_seqs,
+                                           const std::vector<std::string>& initial_hdrs,
+                                           ScoreMode mode, ScoreFn fn) {
     std::cout << "\n--- Starting search for optimal gap penalties ---" << std::endl;
 
     // 1. Define the grid of parameters to search
     std::vector<double> open_penalties;
-    for (double o = -25.0; o <= -10.0; o += 2.5) open_penalties.push_back(o); // e.g., -25, -22.5, ... -10
+    for (double o = -25.0; o <= -10.0; o += 2.5)
+        open_penalties.push_back(o);  // e.g., -25, -22.5, ... -10
 
     std::vector<double> extend_penalties;
-    for (double e = -5.0; e <= -1.0; e += 1.0) extend_penalties.push_back(e); // e.g., -5, -4, -3, -2, -1
+    for (double e = -5.0; e <= -1.0; e += 1.0)
+        extend_penalties.push_back(e);  // e.g., -5, -4, -3, -2, -1
 
     std::vector<GapSearchResult> results(open_penalties.size() * extend_penalties.size());
 
-    // 2. Perform the grid search in parallel
-    // The collapse(2) clause maps the nested loops to a single parallel loop.
-    #pragma omp parallel for collapse(2) schedule(dynamic)
+// 2. Perform the grid search in parallel
+// The collapse(2) clause maps the nested loops to a single parallel loop.
+#pragma omp parallel for collapse(2) schedule(dynamic)
     for (int i = 0; i < open_penalties.size(); ++i) {
         for (int j = 0; j < extend_penalties.size(); ++j) {
             // Each thread works with its own private copy of the gap penalties
@@ -1178,10 +1210,12 @@ GapSearchResult find_optimal_gap_penalties(
             // Seed the leaves of the tree
             std::queue<Node*> q;
             if (root) q.push(root);
-            while(!q.empty()) {
-                Node* u = q.front(); q.pop();
+            while (!q.empty()) {
+                Node* u = q.front();
+                q.pop();
                 if (!u) continue;
-                if (u->leaf) u->profile = { initial_seqs[u->seq_index] };
+                if (u->leaf)
+                    u->profile = {initial_seqs[u->seq_index]};
                 else {
                     if (u->left) q.push(u->left);
                     if (u->right) q.push(u->right);
@@ -1198,7 +1232,8 @@ GapSearchResult find_optimal_gap_penalties(
 
             // #pragma omp critical
             // {
-            //     std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << "). Score: " << score << std::endl;
+            //     std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << ").
+            //     Score: " << score << std::endl;
             // }
 
             // A more complete implementation would free the memory allocated by parseNewick here.
@@ -1226,12 +1261,9 @@ GapSearchResult find_optimal_gap_penalties(
  * @param consensus_seq The pre-computed consensus sequence of the MSA.
  * @param outdir The directory where the output files will be saved.
  */
-void analyze_and_save_consensus(
-    const std::vector<std::string>& msa,
-    const std::vector<std::string>& hdrs,
-    const std::string& consensus_seq,
-    const std::string& outdir)
-{
+void analyze_and_save_consensus(const std::vector<std::string>& msa,
+                                const std::vector<std::string>& hdrs,
+                                const std::string& consensus_seq, const std::string& outdir) {
     if (msa.empty()) {
         return;
     }
@@ -1265,18 +1297,19 @@ void analyze_and_save_consensus(
             for (int i = 0; i < num_seqs; ++i) {
                 char seq_char = msa[i][j];
 
-                // If the character in the sequence is not a gap, its original position counter increases
+                // If the character in the sequence is not a gap, its original position counter
+                // increases
                 if (seq_char != '-') {
                     original_positions[i]++;
                 }
 
                 // If this sequence's character matches the consensus character, record it
                 if (seq_char == consensus_char) {
-                    report_file << "  - Match: Seq '" << hdrs[i]
-                                << "' at original position " << original_positions[i] << "\n";
+                    report_file << "  - Match: Seq '" << hdrs[i] << "' at original position "
+                                << original_positions[i] << "\n";
                 }
             }
-            report_file << "\n"; // Add a newline for readability between columns
+            report_file << "\n";  // Add a newline for readability between columns
         } else {
             // If the consensus is a gap, we still need to advance the position counters
             // for any sequence that has a residue in this column.
@@ -1309,38 +1342,39 @@ int main(int argc, char** argv) {
 
     // 1) Parse flags
     ScoreMode mode = MODE_DNA;
-    ScoreFn   fn   = edna_score;
+    ScoreFn fn = edna_score;
     int argi = 1;
-    while (argi < argc && std::string(argv[argi]).rfind("--",0) == 0) {
+    while (argi < argc && std::string(argv[argi]).rfind("--", 0) == 0) {
         std::string opt = argv[argi++];
         if (opt == "--mode") {
             if (argi >= argc) {
-                std::cerr<<"Error: --mode requires 'dna' or 'protein'.\n";
+                std::cerr << "Error: --mode requires 'dna' or 'protein'.\n";
                 return 1;
             }
             std::string m = argv[argi++];
-            if      (m=="dna")     { mode = MODE_DNA;     fn = edna_score;   }
-            else if (m=="protein") { mode = MODE_PROTEIN; fn = blosum62_score; }
-            else {
-                std::cerr<<"Error: unknown mode '"<<m<<"'. Use dna or protein.\n";
+            if (m == "dna") {
+                mode = MODE_DNA;
+                fn = edna_score;
+            } else if (m == "protein") {
+                mode = MODE_PROTEIN;
+                fn = blosum62_score;
+            } else {
+                std::cerr << "Error: unknown mode '" << m << "'. Use dna or protein.\n";
                 return 1;
             }
-        }
-        else if (opt == "--gap_open") {
+        } else if (opt == "--gap_open") {
             if (argi >= argc) {
-                std::cerr<<"Error: --gap_open requires a value.\n";
+                std::cerr << "Error: --gap_open requires a value.\n";
                 return 1;
             }
             GAP_OPEN = std::stod(argv[argi++]);
-        }
-        else if (opt == "--gap_extend") {
+        } else if (opt == "--gap_extend") {
             if (argi >= argc) {
-                std::cerr<<"Error: --gap_extend requires a value.\n";
+                std::cerr << "Error: --gap_extend requires a value.\n";
                 return 1;
             }
             GAP_EXTEND = std::stod(argv[argi++]);
-        }
-        else {
+        } else {
             // unrecognized flag: step back and break
             --argi;
             break;
@@ -1349,7 +1383,7 @@ int main(int argc, char** argv) {
 
     // 2) Next arg is outdir
     if (argi >= argc) {
-        std::cerr<<"Error: missing outdir.\n";
+        std::cerr << "Error: missing outdir.\n";
         return 1;
     }
     std::string outdir = argv[argi++];
@@ -1357,7 +1391,7 @@ int main(int argc, char** argv) {
 
     // 3) Remaining args are FASTA files
     if (argi >= argc) {
-        std::cerr<<"Error: need at least one FASTA file.\n";
+        std::cerr << "Error: need at least one FASTA file.\n";
         return 1;
     }
     std::vector<std::string> files;
@@ -1376,14 +1410,15 @@ int main(int argc, char** argv) {
 
         // Second, simplify the header to its final form
         if (mode == MODE_PROTEIN) {
-            auto &h = hdrs[i];
+            auto& h = hdrs[i];
             size_t p1 = h.find('|');
-            size_t p2 = (p1==std::string::npos ? std::string::npos : h.find('|',p1+1));
-            if (p1!=std::string::npos && p2!=std::string::npos)
-                hdrs[i] = h.substr(p1+1, p2-p1-1);
-        } else { // DNA mode
-            auto &h = hdrs[i];
-            // Since spaces are now underscores, we simplify by taking the part before the first underscore.
+            size_t p2 = (p1 == std::string::npos ? std::string::npos : h.find('|', p1 + 1));
+            if (p1 != std::string::npos && p2 != std::string::npos)
+                hdrs[i] = h.substr(p1 + 1, p2 - p1 - 1);
+        } else {  // DNA mode
+            auto& h = hdrs[i];
+            // Since spaces are now underscores, we simplify by taking the part before the first
+            // underscore.
             size_t sp = h.find('_');
             if (sp != std::string::npos) {
                 hdrs[i] = h.substr(0, sp);
@@ -1391,40 +1426,40 @@ int main(int argc, char** argv) {
         }
     }
 
-
     // Find Optimal Gap Penalties before proceeding
     auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
     GAP_OPEN = best_params.gap_open;
     GAP_EXTEND = best_params.gap_extend;
-    std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN << ", GAP_EXTEND=" << GAP_EXTEND
-              << " with score: " << best_params.score << "\n" << std::endl;
+    std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN
+              << ", GAP_EXTEND=" << GAP_EXTEND << " with score: " << best_params.score << "\n"
+              << std::endl;
 
     // 5) Simplify headers
     for (int i = 0; i < n; ++i) {
         if (mode == MODE_PROTEIN) {
-            auto &h = hdrs[i];
+            auto& h = hdrs[i];
             size_t p1 = h.find('|');
-            size_t p2 = (p1==std::string::npos ? std::string::npos : h.find('|',p1+1));
-            if (p1!=std::string::npos && p2!=std::string::npos)
-                hdrs[i] = h.substr(p1+1, p2-p1-1);
+            size_t p2 = (p1 == std::string::npos ? std::string::npos : h.find('|', p1 + 1));
+            if (p1 != std::string::npos && p2 != std::string::npos)
+                hdrs[i] = h.substr(p1 + 1, p2 - p1 - 1);
         } else {
-            auto &h = hdrs[i];
+            auto& h = hdrs[i];
             size_t sp = h.find_first_of(" \t");
-            if (sp!=std::string::npos) hdrs[i] = h.substr(0, sp);
+            if (sp != std::string::npos) hdrs[i] = h.substr(0, sp);
         }
     }
 
     // 6) Compute guide tree
-    auto D    = computeDistanceMatrix(seqs, mode, fn);
+    auto D = computeDistanceMatrix(seqs, mode, fn);
     // Save the identity matrix to a file
     saveIdentityMatrix(D, hdrs, outdir);
-    auto nwk  = buildUPGMATree(D, hdrs);
+    auto nwk = buildUPGMATree(D, hdrs);
 
     // Format the Newick string for readability before saving
     std::string nwk_formatted = formatNewickString(nwk);
 
-    std::ofstream tf(outdir+"/guide_tree.nwk");
-    tf << nwk_formatted; // The formatted string already contains newlines
+    std::ofstream tf(outdir + "/guide_tree.nwk");
+    tf << nwk_formatted;  // The formatted string already contains newlines
     tf.close();
 
     // 7) Progressive MSA by walking the UPGMA tree
@@ -1433,19 +1468,20 @@ int main(int argc, char** argv) {
 
     //    seed each leaf with its raw sequence
     std::queue<Node*> q;
-    if (root) q.push(root); // Push only if the root is valid
+    if (root) q.push(root);  // Push only if the root is valid
     while (!q.empty()) {
-        Node* u = q.front(); q.pop();
-        if (!u) continue; // Skip if a null pointer somehow got on the queue
+        Node* u = q.front();
+        q.pop();
+        if (!u) continue;  // Skip if a null pointer somehow got on the queue
 
         if (u->leaf) {
             // Verify the index is valid before accessing the 'seqs' vector.
             if (u->seq_index < 0 || u->seq_index >= seqs.size()) {
                 std::cerr << "\nFATAL LOGIC ERROR: Invalid sequence index " << u->seq_index
                           << " detected for a leaf node. Cannot retrieve sequence." << std::endl;
-                exit(1); // Exit with an error
+                exit(1);  // Exit with an error
             }
-            u->profile = { seqs[u->seq_index] };
+            u->profile = {seqs[u->seq_index]};
         } else {
             // Push children only if they are not null
             if (u->left) q.push(u->left);
@@ -1458,7 +1494,7 @@ int main(int argc, char** argv) {
 
     // Refine the MSA using multiple threads over several rounds
     int total_rounds = 3;
-    int iterations_per_thread_per_round = 10; // Total work = rounds * iterations * num_threads
+    int iterations_per_thread_per_round = 10;  // Total work = rounds * iterations * num_threads
     msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn);
 
     // 10) Print and save colored MSA
@@ -1476,10 +1512,9 @@ int main(int argc, char** argv) {
     analyze_and_save_consensus(msa, hdrs, final_consensus, outdir);
 
     // 12) Write out main MSA in FASTA format
-    std::ofstream mf(outdir+"/msa.fasta");
+    std::ofstream mf(outdir + "/msa.fasta");
     for (int i = 0; i < n; ++i) {
-        mf << ">" << hdrs[i] << "\n"
-           << msa[i]  << "\n";
+        mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
     }
     mf.close();
 
