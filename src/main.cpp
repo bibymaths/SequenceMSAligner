@@ -1,20 +1,22 @@
-/***************************************************************************
-*   Copyright (C) 2025-2026 by Abhinav Mishra                              *
- *   mishraabhinav36@gmail.com                                               *
- *                                                                         *
- *   This program is free software; you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation; either version 2 of the License, or     *
- *   (at your option) any later version.                                   *
- *                                                                         *
- *   This program is distributed in the hope that it will be useful,       *
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
- *   GNU General Public License for more details.                          *
- *                                                                         *
- *   You should have received a copy of the BSD 3-Clause License           *
- *   along with this program; if not, write to the author                  *
- ***************************************************************************/
+/**
+ * @file main.cpp
+ * @brief Multiple sequence alignment (MSA) tool for DNA and protein sequences.
+ *
+ * Implements a full MSA pipeline including:
+ *  - Pairwise global alignment via affine-gap Needleman-Wunsch with AVX2
+ *    vectorization.
+ *  - UPGMA guide-tree construction from a pairwise identity distance matrix.
+ *  - Three independent progressive alignment strategies run in parallel:
+ *    (1) Standard progressive NW, (2) FFT-seeded banded alignment, and
+ *    (3) COFFEE Log-Expectation (LE) guided alignment.
+ *  - Iterative MSA refinement using random profile splitting and
+ *    Sum-of-Pairs (SP) score optimization across OpenMP threads.
+ *  - HTML and FASTA output with color-coded conservation visualization.
+ *
+ * @author Abhinav Mishra <mishraabhinav36@gmail.com>
+ * @copyright Copyright (C) 2025-2026 Abhinav Mishra
+ * @license BSD 3-Clause
+ */
 
 #include <immintrin.h>
 #include <omp.h>
@@ -48,19 +50,47 @@
 #define RED "\033[31m"
 #define CYAN "\033[36m"
 
-// Gap penalties
+/**
+ * @brief Holds affine gap penalty parameters for sequence alignment.
+ *
+ * Gap cost for a run of k gaps is computed as:
+ *   cost = gap_open + k * gap_extend
+ *
+ * Both values should be negative. @c gap_open penalizes the initiation
+ * of a new gap and @c gap_extend penalizes each additional position within
+ * an existing gap.
+ */
 struct AlignParams {
-  double gap_open   = -10.0;
-  double gap_extend = -0.5;
+  double gap_open = -10.0;  ///< Penalty for opening a new gap.
+  double gap_extend =
+      -0.5;  ///< Penalty for extending an existing gap by one position.
 };
 
+/**
+ * @brief A node in the UPGMA guide tree used for progressive alignment.
+ *
+ * Leaf nodes correspond to individual input sequences. Internal nodes
+ * represent merged alignment profiles. The @c profile field is populated
+ * bottom-up during the progressive alignment traversal.
+ */
 struct Node {
-  bool                     leaf;
-  int                      seq_index;
-  std::vector<std::string> profile;
-  Node *                   left = nullptr, *right = nullptr;
+  bool leaf;       ///< True if this is a leaf (single sequence) node.
+  int  seq_index;  ///< Index into the original sequence array; valid only if @c
+                   ///< leaf is true.
+  std::vector<std::string> profile;  ///< Aligned sequences accumulated at this
+                                     ///< node during tree traversal.
+  Node* left  = nullptr;  ///< Left child node; nullptr for leaf nodes.
+  Node* right = nullptr;  ///< Right child node; nullptr for leaf nodes.
 };
 
+/**
+ * @brief Recursively deallocates all nodes of a guide tree.
+ *
+ * Performs a post-order traversal, freeing children before the parent,
+ * to prevent use-after-free. Safe to call with a null pointer.
+ *
+ * @param n Pointer to the root node of the tree to free. May be @c nullptr.
+ */
 void free_tree(Node* n) {
   if (!n) return;
   free_tree(n->left);
@@ -110,13 +140,14 @@ static const std::array<uint8_t, 256> prot_idx = []() {
 }();
 
 /**
- * @brief Computes the BLOSUM62 score for a pair of amino acids.
- * This function maps characters to their corresponding indices in the BLOSUM62
- * matrix and returns the score for the pair.
+ * @brief Returns the BLOSUM62 substitution score for a pair of amino acids.
  *
- * @param x The first amino acid character.
- * @param y The second amino acid character.
- * @return The BLOSUM62 score for the pair.
+ * Characters are converted to uppercase before lookup. Unknown or
+ * non-standard amino acids are mapped to @c 'X' before querying the matrix.
+ *
+ * @param x First amino acid character (case-insensitive).
+ * @param y Second amino acid character (case-insensitive).
+ * @return  Integer substitution score from the BLOSUM62 matrix.
  */
 inline int blosum62_score(char x, char y) {
   // map to uppercase in case it slipped through
@@ -132,13 +163,15 @@ inline int blosum62_score(char x, char y) {
 }
 
 /**
- * @brief Computes the score for a pair of characters using the appropriate
- * scoring matrix. This function uses the EDNAFULL matrix for DNA sequences and
- * the BLOSUM62 matrix for protein sequences.
+ * @brief Returns the EDNAFULL substitution score for a pair of nucleotides.
  *
- * @param x The first character.
- * @param y The second character.
- * @return The score for the character pair.
+ * Characters are converted to uppercase before lookup. Handles all IUPAC
+ * ambiguity codes (R, Y, S, W, K, M, B, D, H, V, N). Unknown characters
+ * are mapped to @c 'N' before querying the matrix.
+ *
+ * @param x First nucleotide character (case-insensitive, IUPAC).
+ * @param y Second nucleotide character (case-insensitive, IUPAC).
+ * @return  Integer substitution score from the EDNAFULL matrix.
  */
 inline int edna_score(char x, char y) {
   x = static_cast<char>(std::toupper((unsigned char)x));
@@ -153,22 +186,30 @@ inline int edna_score(char x, char y) {
 }
 
 /**
- * @brief Computes the score for a pair of characters based on the specified
- * scoring mode. This function uses the EDNAFULL matrix for DNA sequences and
- * the BLOSUM62 matrix for protein sequences.
+ * @brief Dispatches to the correct substitution scoring function based on mode.
  *
- * @param x The first character.
- * @param y The second character.
- * @param mode The scoring mode (DNA or Protein).
- * @return The score for the character pair.
+ * @param x    First sequence character.
+ * @param y    Second sequence character.
+ * @param mode Scoring mode: @c MODE_DNA uses EDNAFULL, @c MODE_PROTEIN uses
+ * BLOSUM62.
+ * @return     Integer substitution score.
  */
 inline int score(char x, char y, ScoreMode mode) {
   return mode == MODE_DNA ? edna_score(x, y) : blosum62_score(x, y);
 }
 
 /**
- * @brief Performs an in-place Fast Fourier Transform (FFT) on a complex array.
- * @param x The input array of complex numbers to be transformed. The result is stored in the same array.
+ * @brief Performs an in-place Cooley-Tukey radix-2 decimation-in-time FFT.
+ *
+ * Recursively splits the input into even- and odd-indexed elements,
+ * transforms each half, then combines them using the butterfly operation.
+ * The array length must be a power of 2; no length validation is performed.
+ *
+ * Time complexity: O(N log N).
+ *
+ * @param[in,out] x Complex-valued array of length 2^k to transform in place.
+ *                  On return, contains the discrete Fourier transform of the
+ * input.
  */
 void fft(CArray& x) {
   const size_t N = x.size();
@@ -188,11 +229,22 @@ void fft(CArray& x) {
 }
 
 /**
- * @brief Encodes a sequence into a numerical vector based on the specified scoring mode. For protein sequences, it uses the Kyte-Doolittle hydrophobicity scale, and for DNA sequences, it uses a binary encoding for purines and pyrimidines.
+ * @brief Encodes a biological sequence as a real-valued numeric vector for FFT.
  *
- * @param seq The input sequence to be encoded.
- * @param mode The scoring mode (DNA or Protein) that determines the encoding scheme.
- * @return A vector of doubles representing the encoded sequence.
+ * Two encoding schemes are used depending on the scoring mode:
+ *  - **Protein**: Kyte-Doolittle hydrophobicity scale. Hydrophobic residues
+ *    receive positive values; hydrophilic residues receive negative values.
+ *    Unrecognized amino acids are encoded as 0.0.
+ *  - **DNA**: Binary purine/pyrimidine indicator. Purines (A, G) → +1.0;
+ *    pyrimidines (C, T, U) → −1.0. Ambiguous bases encode as 0.0.
+ *
+ * The resulting vector is suitable as input to @c fftCrossCorrelation to
+ * estimate the relative offset between two sequences without full DP alignment.
+ *
+ * @param seq  Input sequence string (uppercase recommended).
+ * @param mode Encoding mode: @c MODE_PROTEIN or @c MODE_DNA.
+ * @return     Vector of doubles of length @c seq.size() containing the
+ * encoding.
  */
 std::vector<double> encodeSequence(const std::string& seq, ScoreMode mode) {
   // Hydrophobicity (Kyte-Doolittle) for protein
@@ -239,12 +291,27 @@ std::vector<double> encodeSequence(const std::string& seq, ScoreMode mode) {
 }
 
 /**
- * @brief Computes the cross-correlation between two sequences using the Fast Fourier Transform (FFT). This function encodes the sequences based on the specified scoring mode, performs FFT-based convolution to compute the cross-correlation, and identifies the best offset and corresponding score.
+ * @brief Estimates the best alignment offset between two sequences via FFT
+ * cross-correlation.
  *
- * @param a The first input sequence.
- * @param b The second input sequence.
- * @param mode The scoring mode (DNA or Protein) that determines the encoding scheme for the sequences.
- * @return A pair containing the best offset (shift) and the corresponding cross-correlation score.
+ * Encodes both sequences as real-valued vectors (see @c encodeSequence),
+ * zero-pads them to the next power-of-2 length, computes their
+ * cross-correlation in the frequency domain as @f$ F_a \cdot \overline{F_b}
+ * @f$, and locates the peak of the inverse transform. The peak position is the
+ * shift of @p b relative to @p a that maximises their physicochemical
+ * similarity.
+ *
+ * Negative offsets (b shifted left of a) are recovered by wrapping indices in
+ * @f$ [N/2, N) @f$ back to @f$ [-(N/2), 0) @f$.
+ *
+ * Time complexity: O((|a| + |b|) log(|a| + |b|)).
+ *
+ * @param a    First sequence.
+ * @param b    Second sequence.
+ * @param mode Encoding mode passed to @c encodeSequence.
+ * @return     A pair @c {best_offset, best_score} where @c best_offset is the
+ *             integer shift of @p b relative to @p a with the highest
+ * correlation and @c best_score is the corresponding correlation value.
  */
 std::pair<int, double> fftCrossCorrelation(const std::string& a,
                                            const std::string& b,
@@ -285,10 +352,13 @@ std::pair<int, double> fftCrossCorrelation(const std::string& a,
   return {best_offset, best_score};
 }
 
-/** @brief Sanitizes a FASTA header by replacing spaces with underscores.
- * This is useful for ensuring that headers are valid identifiers in various
- * contexts.
- * @param header The header string to sanitize.
+/**
+ * @brief Replaces all whitespace characters in a FASTA header with underscores.
+ *
+ * This normalization ensures headers can be used as identifiers in Newick
+ * strings and output filenames without quoting or escaping.
+ *
+ * @param[in,out] header FASTA header string to sanitize in place.
  */
 void sanitize_header(std::string& header) {
   for (char& c : header) {
@@ -299,13 +369,17 @@ void sanitize_header(std::string& header) {
 }
 
 /**
- * @brief Processes a FASTA file to extract the header and sequence.
- * This function reads a FASTA file, extracts the first header line,
- * and concatenates all sequence lines into a single uppercase string.
+ * @brief Reads a FASTA file and extracts the first sequence record.
  *
- * @param fn The filename of the FASTA file.
- * @param hdr Output parameter for the header (without '>' prefix).
- * @param seq Output parameter for the sequence (uppercase, no gaps).
+ * Only the first header line (the line beginning with @c '>') is captured.
+ * All subsequent sequence lines are concatenated into a single uppercase
+ * string with non-alphabetic characters silently discarded.
+ * Multi-record FASTA files are partially read — only the first record is used.
+ *
+ * @param fn   Path to the FASTA file to read.
+ * @param[out] hdr Header string without the leading @c '>' character.
+ * @param[out] seq Uppercase sequence with all non-alpha characters removed.
+ * @throws std::runtime_error if the file cannot be opened.
  */
 void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
   std::ifstream f(fn);
@@ -334,16 +408,36 @@ void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
 }
 
 /**
- * @brief Computes the global alignment score between two sequences using a
- * modified Needleman-Wunsch algorithm with AVX2 vectorization.
+ * @brief Computes a global pairwise alignment using affine-gap Needleman-Wunsch
+ *        with AVX2 SIMD vectorization.
  *
- * @param x The first sequence.
- * @param y The second sequence.
- * @param mode The scoring mode (DNA or Protein).
- * @param score_fn The scoring function to use for matches/mismatches.
- * @param aligned_x Output string for the aligned first sequence.
- * @param aligned_y Output string for the aligned second sequence.
- * @return The final alignment score.
+ * Implements the three-matrix recurrence (S, E, F) for affine gap costs:
+ * @f[
+ *   E_{i,j} = \max(S_{i,j-1} + g_o,\; E_{i,j-1} + g_e)
+ * @f]
+ * @f[
+ *   F_{i,j} = \max(S_{i-1,j} + g_o,\; F_{i-1,j} + g_e)
+ * @f]
+ * @f[
+ *   S_{i,j} = \max(S_{i-1,j-1} + \sigma(x_i, y_j),\; E_{i,j},\; F_{i,j})
+ * @f]
+ * where @f$ g_o @f$ = @c p.gap_open and @f$ g_e @f$ = @c p.gap_extend.
+ *
+ * The inner loop processes 8 columns per iteration using 256-bit AVX2
+ * integer intrinsics (@c _mm256_max_epi32, @c _mm256_add_epi32). Gap
+ * penalties are rounded to the nearest integer before use in the DP.
+ * A full traceback matrix is stored and walked after the fill phase.
+ *
+ * @param x         First sequence (ungapped, uppercase).
+ * @param y         Second sequence (ungapped, uppercase).
+ * @param mode      Scoring mode (@c MODE_DNA or @c MODE_PROTEIN), forwarded
+ *                  to @p score_fn for documentation but not used directly.
+ * @param score_fn  Substitution scoring function pointer (e.g. @c edna_score
+ *                  or @c blosum62_score).
+ * @param[out] aligned_x  Aligned version of @p x with gap characters inserted.
+ * @param[out] aligned_y  Aligned version of @p y with gap characters inserted.
+ * @param p         Affine gap penalty parameters.
+ * @return          Integer alignment score of the optimal global alignment.
  */
 int computeGlobalAlignment(const std::string& x, const std::string& y,
                            ScoreMode mode, ScoreFn score_fn,
@@ -514,13 +608,16 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
 }
 
 /**
- * @brief Generates a consensus sequence from a multiple sequence alignment
- * profile. This function computes the most frequent character in each column of
- * the profile, ignoring gaps ('-'), and returns the resulting consensus
- * sequence.
+ * @brief Derives a consensus sequence from a multiple sequence alignment
+ * profile.
  *
- * @param profile A vector of strings representing the aligned sequences.
- * @return The consensus sequence as a string.
+ * For each alignment column, counts the frequency of each non-gap character
+ * across all sequences and selects the plurality character. Columns where all
+ * sequences contain a gap yield @c '-' in the consensus.
+ *
+ * @param profile  Vector of equally-length aligned sequence strings.
+ * @return         Consensus string of the same length as the alignment columns.
+ *                 Returns an empty string if @p profile is empty.
  */
 std::string generate_consensus(const std::vector<std::string>& profile) {
   if (profile.empty() || profile[0].empty()) {
@@ -551,9 +648,28 @@ std::string generate_consensus(const std::vector<std::string>& profile) {
 }
 
 /**
- * @brief Calculates the Sum-of-Pairs (SP) score for a given MSA with a true
- * affine gap penalty. This version iterates over each pair of sequences to
- * correctly apply open and extend penalties.
+ * @brief Computes the Sum-of-Pairs (SP) score of a multiple sequence alignment
+ *        under an affine gap penalty model.
+ *
+ * For every unique ordered pair of sequences @f$(i, k)@f$, the score is:
+ * @f[
+ *   \text{SP} = \sum_{i < k} \sum_{j} \text{col\_score}(i, k, j)
+ * @f]
+ * where each column contributes one of three cases:
+ *  - **Residue vs residue**: @f$ \sigma(c_i, c_k) @f$ from the substitution
+ * matrix.
+ *  - **Residue vs gap (gap opening)**: @f$ g_o + g_e @f$
+ *  - **Residue vs gap (gap extension)**: @f$ g_e @f$
+ *  - **Gap vs gap**: 0 (no penalty for double-gap columns).
+ *
+ * Gap state is tracked independently for each pair so that parallel gaps
+ * in different pairs do not interfere.
+ *
+ * @param msa   Vector of equally-length aligned sequences.
+ * @param mode  Scoring mode passed to @c score().
+ * @param fn    Substitution scoring function pointer.
+ * @param p     Affine gap penalty parameters.
+ * @return      Total SP score as a @c long long. Higher is better.
  */
 long long calculate_sp_score(const std::vector<std::string>& msa,
                              ScoreMode mode, ScoreFn fn, const AlignParams& p) {
@@ -613,9 +729,20 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
 }
 
 /**
- * @brief Projects gaps from a newly aligned representative sequence into a
- * profile. This version correctly compares the old and new representatives to
- * only insert newly added gaps, preventing alignment corruption.
+ * @brief Propagates newly introduced gap columns from an aligned representative
+ *        sequence into its entire profile.
+ *
+ * Compares @p oldc (the pre-alignment representative) against @p newc (the
+ * post-alignment representative) character by character. Wherever @p newc
+ * introduces a @c '-' that does not exist in @p oldc, a corresponding column
+ * of @c '-' characters is inserted at the same position in every string in
+ * @p seqs. This preserves the structural integrity of the profile when
+ * merging two sub-alignments.
+ *
+ * @param oldc Pre-alignment (ungapped) representative consensus string.
+ * @param newc Post-alignment (gapped) representative consensus string.
+ * @param[in,out] seqs Profile strings to update. All strings are extended
+ *                     in place with the same gap insertions applied to @p newc.
  */
 void projectGaps(const std::string& oldc, const std::string& newc,
                  std::vector<std::string>& seqs) {
@@ -638,13 +765,26 @@ void projectGaps(const std::string& oldc, const std::string& newc,
 }
 
 /**
- * @brief Compute identity‐based distance matrix in parallel.
- * @param seqs The input sequences for which the distance matrix is to be computed.
- * @param mode The scoring mode (DNA or Protein) that determines the scoring function used for pairwise alignments.
- * @param fn The scoring function to use for pairwise alignments, which should be compatible with the specified scoring mode.
- * @param p The alignment parameters containing gap penalties.
+ * @brief Builds a pairwise distance matrix from global alignment identity
+ * scores.
  *
- * @return A 2D vector representing the distance matrix, where D[i][j] is the distance between sequences i and j based on their global alignment identity.
+ * For each unique pair @f$(i, j)@f$, runs @c computeGlobalAlignment and
+ * computes the fractional identity as:
+ * @f[
+ *   \text{identity} = \frac{\text{matches}}{L},\quad
+ *   D_{ij} = 1 - \text{identity}
+ * @f]
+ * where @f$ L @f$ is the alignment length and matches are positions where
+ * both aligned characters are equal and non-gap. The matrix is symmetric.
+ *
+ * All @f$ N(N-1)/2 @f$ pairs are computed in parallel using OpenMP.
+ *
+ * @param seqs Vector of ungapped input sequences.
+ * @param mode Scoring mode for pairwise alignment.
+ * @param fn   Substitution scoring function pointer.
+ * @param p    Affine gap penalty parameters.
+ * @return     Symmetric @f$ N \times N @f$ distance matrix @c D where
+ *             @c D[i][i] = 0 and @c D[i][j] ∈ [0, 1].
  */
 std::vector<std::vector<double>> computeDistanceMatrix(
     const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
@@ -685,7 +825,7 @@ struct PairLib {
   int N;  ///< Number of input sequences.
   /// @c lib[i][k] holds residue-pair positions from the optimal
   /// pairwise alignment of sequences i and k (i < k only).
-  std::vector<std::vector<std::set<std::pair<int,int>>>> lib;
+  std::vector<std::vector<std::set<std::pair<int, int>>>> lib;
 };
 
 /**
@@ -739,18 +879,35 @@ PairLib buildPairLib(const std::vector<std::string>& seqs, ScoreMode mode,
 }
 
 /**
- * @brief Computes a banded global alignment between two sequences using a modified Needleman-Wunsch algorithm. The band is centered around a seed offset, which can be determined by
- * @param x The first sequence to be aligned.
- * @param y The second sequence to be aligned.
- * @param mode The scoring mode (DNA or Protein) that determines the scoring function used for
- * @param fn The scoring function to use for matches/mismatches, which should be compatible with the specified scoring mode.
- * @param aligned_x Output string for the aligned first sequence.
- * @param aligned_y Output string for the aligned second sequence.
- * @param p The alignment parameters containing gap penalties.
- * @param seed_offset The diagonal offset around which the band is centered. A value of
- * @param bandwidth The width of the band around the seed offset. Only cells within this band will be computed, which can significantly reduce computation time for similar sequences.
+ * @brief Computes a banded global alignment seeded from an FFT-derived offset.
  *
- * @return The final alignment score for the best path found within the band. If the optimal alignment falls outside the band, the function will fall back to a full Needleman-Wunsch computation.
+ * Runs the affine-gap Needleman-Wunsch recurrence but restricts filling to
+ * cells within @p bandwidth diagonals of the seed diagonal:
+ * @f[
+ *   |j - i - \text{seed\_offset}| \leq \text{bandwidth}
+ * @f]
+ * Cells outside the band remain at @c INT_MIN/2 and are skipped. This reduces
+ * time complexity from @f$ O(mn) @f$ to @f$ O((m+n) \cdot \text{bandwidth}) @f$
+ * for sequences whose true alignment lies near the seed diagonal.
+ *
+ * If the band fails to reach the endpoint @f$ S[m][n] @f$ (i.e., the true
+ * alignment lies outside the band), the function transparently falls back to
+ * a full @c computeGlobalAlignment call so the result is always valid.
+ *
+ * @param x           First sequence (ungapped, uppercase).
+ * @param y           Second sequence (ungapped, uppercase).
+ * @param mode        Scoring mode, forwarded to @p fn.
+ * @param fn          Substitution scoring function pointer.
+ * @param[out] aligned_x Aligned version of @p x with gap characters inserted.
+ * @param[out] aligned_y Aligned version of @p y with gap characters inserted.
+ * @param p           Affine gap penalty parameters.
+ * @param seed_offset Diagonal offset @f$(j - i)@f$ around which to centre
+ *                    the band. Typically the peak index returned by
+ *                    @c fftCrossCorrelation.
+ * @param bandwidth   Half-width of the band in diagonal units. Default is 50.
+ *                    Increase for more divergent sequences.
+ * @return            Alignment score of the best path found within the band,
+ *                    or the full NW score if the band fallback was triggered.
  */
 int computeBandedAlignment(const std::string& x, const std::string& y,
                            ScoreMode mode, ScoreFn fn, std::string& aligned_x,
@@ -949,11 +1106,8 @@ std::vector<std::string> build_profile_fft(Node* n, ScoreMode mode, ScoreFn fn,
  *      computeGlobalAlignment()
  */
 std::vector<std::string> merge_profiles_le(
-    std::vector<std::string>& A,
-    std::vector<std::string>& B,
-    const PairLib&             pl,
-    const std::vector<int>&    idx_A,
-    const std::vector<int>&    idx_B,
+    std::vector<std::string>& A, std::vector<std::string>& B, const PairLib& pl,
+    const std::vector<int>& idx_A, const std::vector<int>& idx_B,
     ScoreMode mode, ScoreFn fn, const AlignParams& p) {
   std::string consA = generate_consensus(A);
   std::string consB = generate_consensus(B);
@@ -979,8 +1133,8 @@ std::vector<std::string> merge_profiles_le(
  * by merge_profiles_le() to look up residue pairs in the PairLib.
  */
 struct LENode {
-  std::vector<std::string> profile;      ///< Column-aligned sequences at this node.
-  std::vector<int>         seq_indices;  ///< Indices into the original @c seqs vector.
+  std::vector<std::string> profile;  ///< Column-aligned sequences at this node.
+  std::vector<int> seq_indices;  ///< Indices into the original @c seqs vector.
 };
 
 /**
@@ -1731,9 +1885,10 @@ std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn,
  * @brief Holds the result of a gap-penalty grid search.
  */
 struct GapSearchResult {
-  long long score      = -LLONG_MAX; ///< Best SP score found across all parameter combos.
-  double    gap_open   = 0.0;        ///< Gap-open penalty that achieved @c score.
-  double    gap_extend = 0.0;        ///< Gap-extend penalty that achieved @c score.
+  long long score =
+      -LLONG_MAX;  ///< Best SP score found across all parameter combos.
+  double gap_open   = 0.0;  ///< Gap-open penalty that achieved @c score.
+  double gap_extend = 0.0;  ///< Gap-extend penalty that achieved @c score.
 };
 
 /**
