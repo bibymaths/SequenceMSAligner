@@ -41,7 +41,8 @@ nav:
   - Algorithms: ALGORITHMS.md
   - Usage: USAGE.md
   - References: REFERENCES.md
-  - C++ API: API.md
+  - API: API.md
+  - C++ API: https://bibymaths.github.io/SequenceMSAligner/api/index.html
 
 markdown_extensions:
   - pymdownx.arithmatex:
