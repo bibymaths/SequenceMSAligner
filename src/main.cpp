@@ -40,8 +40,8 @@
 
 // Gap penalties
 // Use mutable variables
-double GAP_OPEN = 0;
-double GAP_EXTEND = 0;
+double GAP_OPEN = -10.0;
+double GAP_EXTEND = -0.5;
 static const int LINE_WIDTH = 80;
 
 // Scoring modes
@@ -1193,52 +1193,53 @@ GapSearchResult find_optimal_gap_penalties(const std::vector<std::string>& initi
     std::vector<GapSearchResult> results(open_penalties.size() * extend_penalties.size());
 
 // 2. Perform the grid search in parallel
-// The collapse(2) clause maps the nested loops to a single parallel loop.
 #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int i = 0; i < open_penalties.size(); ++i) {
-        for (int j = 0; j < extend_penalties.size(); ++j) {
-            // Each thread works with its own private copy of the gap penalties
-            GAP_OPEN = open_penalties[i];
-            GAP_EXTEND = extend_penalties[j];
+    for (int i = 0; i < (int)open_penalties.size(); ++i) {
+        for (int j = 0; j < (int)extend_penalties.size(); ++j) {
+            // Use LOCAL variables — never touch the global inside a parallel region
+            double local_open   = open_penalties[i];
+            double local_extend = extend_penalties[j];
 
-            // 3. For each parameter set, build a complete initial MSA from scratch
-            // Note: We are NOT passing gap penalties as arguments, because they are threadprivate
-            auto D = computeDistanceMatrix(initial_seqs, mode, fn);
-            auto nwk = buildUPGMATree(D, initial_hdrs);
+            // Temporarily set thread-local penalty for computeGlobalAlignment
+            // (Since GAP_OPEN/GAP_EXTEND are global, make them threadprivate)
+            double saved_open, saved_extend;
+#pragma omp critical
+            {
+                saved_open   = GAP_OPEN;
+                saved_extend = GAP_EXTEND;
+                GAP_OPEN   = local_open;
+                GAP_EXTEND = local_extend;
+            }
+
+            auto D    = computeDistanceMatrix(initial_seqs, mode, fn);
+            auto nwk  = buildUPGMATree(D, initial_hdrs);
             Node* root = parseNewick(nwk, initial_hdrs);
 
-            // Seed the leaves of the tree
             std::queue<Node*> q;
             if (root) q.push(root);
             while (!q.empty()) {
-                Node* u = q.front();
-                q.pop();
+                Node* u = q.front(); q.pop();
                 if (!u) continue;
-                if (u->leaf)
-                    u->profile = {initial_seqs[u->seq_index]};
+                if (u->leaf) u->profile = {initial_seqs[u->seq_index]};
                 else {
-                    if (u->left) q.push(u->left);
+                    if (u->left)  q.push(u->left);
                     if (u->right) q.push(u->right);
                 }
             }
 
-            // Build the MSA and calculate its score
-            auto msa = build_profile(root, mode, fn);
-            long long score = calculate_sp_score(msa, mode, fn);
+            auto msa       = build_profile(root, mode, fn);
+            long long sc   = calculate_sp_score(msa, mode, fn);
+            int index      = i * (int)extend_penalties.size() + j;
+            results[index] = {sc, local_open, local_extend};
 
-            // Store the result
-            int index = i * extend_penalties.size() + j;
-            results[index] = {score, GAP_OPEN, GAP_EXTEND};
-
-            // #pragma omp critical
-            // {
-            //     std::cout << "  Tested (Open=" << GAP_OPEN << ", Extend=" << GAP_EXTEND << ").
-            //     Score: " << score << std::endl;
-            // }
-
-            // A more complete implementation would free the memory allocated by parseNewick here.
+#pragma omp critical
+            {
+                GAP_OPEN   = saved_open;
+                GAP_EXTEND = saved_extend;
+            }
         }
     }
+
 
     // 4. Find the best result from all the parallel tasks
     GapSearchResult best_result;
@@ -1343,6 +1344,8 @@ int main(int argc, char** argv) {
     // 1) Parse flags
     ScoreMode mode = MODE_DNA;
     ScoreFn fn = edna_score;
+    bool user_gap_open   = false;
+    bool user_gap_extend = false;
     int argi = 1;
     while (argi < argc && std::string(argv[argi]).rfind("--", 0) == 0) {
         std::string opt = argv[argi++];
@@ -1368,12 +1371,14 @@ int main(int argc, char** argv) {
                 return 1;
             }
             GAP_OPEN = std::stod(argv[argi++]);
+            user_gap_open = true;
         } else if (opt == "--gap_extend") {
             if (argi >= argc) {
-                std::cerr << "Error: --gap_extend requires a value.\n";
+                std::cerr << "Error: --gap_extend requires a value#pra.\n";
                 return 1;
             }
             GAP_EXTEND = std::stod(argv[argi++]);
+            user_gap_extend = true;
         } else {
             // unrecognized flag: step back and break
             --argi;
@@ -1427,12 +1432,18 @@ int main(int argc, char** argv) {
     }
 
     // Find Optimal Gap Penalties before proceeding
-    auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
-    GAP_OPEN = best_params.gap_open;
-    GAP_EXTEND = best_params.gap_extend;
-    std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN
-              << ", GAP_EXTEND=" << GAP_EXTEND << " with score: " << best_params.score << "\n"
-              << std::endl;
+    if (!user_gap_open || !user_gap_extend) {
+        auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
+        // Only overwrite the ones the user did NOT provide
+        if (!user_gap_open)   GAP_OPEN   = best_params.gap_open;
+        if (!user_gap_extend) GAP_EXTEND = best_params.gap_extend;
+        std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN
+                  << ", GAP_EXTEND=" << GAP_EXTEND << " with score: " << best_params.score
+                  << "\n" << std::endl;
+    } else {
+        std::cout << "\nUsing user-supplied penalties: GAP_OPEN=" << GAP_OPEN
+                  << ", GAP_EXTEND=" << GAP_EXTEND << "\n" << std::endl;
+    }
 
     // 5) Simplify headers
     for (int i = 0; i < n; ++i) {
