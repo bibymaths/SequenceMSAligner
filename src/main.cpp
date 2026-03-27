@@ -1,11 +1,20 @@
-/* @file main.cpp
- * @brief Main file for a multiple sequence alignment tool.
- * This tool supports both DNA and protein sequences, implements
- * multiple sequence alignment using a star method,
- * and allows for iterative refinement of the alignment.
- *
- * Author: Abhinav Mishra
- */
+/***************************************************************************
+*   Copyright (C) 2025-2026 by Abhinav Mishra                              *
+ *   mishraabhinav36@gmail.com                                               *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the BSD 3-Clause License           *
+ *   along with this program; if not, write to the author                  *
+ ***************************************************************************/
 
 #include <immintrin.h>
 #include <omp.h>
@@ -15,6 +24,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <complex>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -24,9 +34,9 @@
 #include <set>
 #include <sstream>
 #include <stack>
-#include <stdexcept>
 #include <string>
 #include <tuple>
+#include <valarray>
 #include <vector>
 
 #include "EBLOSUM62.h"
@@ -43,11 +53,28 @@ struct AlignParams {
   double gap_open   = -10.0;
   double gap_extend = -0.5;
 };
+
+struct Node {
+  bool                     leaf;
+  int                      seq_index;
+  std::vector<std::string> profile;
+  Node *                   left = nullptr, *right = nullptr;
+};
+
+void free_tree(Node* n) {
+  if (!n) return;
+  free_tree(n->left);
+  free_tree(n->right);
+  delete n;
+}
+
 static const int LINE_WIDTH = 80;
 
 // Scoring modes
 enum ScoreMode { MODE_DNA, MODE_PROTEIN };
 using ScoreFn = int (*)(char, char);
+
+using CArray = std::valarray<std::complex<double>>;
 
 // DNA / EDNAFULL lookup
 static const std::array<uint8_t, 256> char2idx = []() {
@@ -137,6 +164,173 @@ inline int edna_score(char x, char y) {
  */
 inline int score(char x, char y, ScoreMode mode) {
   return mode == MODE_DNA ? edna_score(x, y) : blosum62_score(x, y);
+}
+
+/**
+ * @brief Performs an in-place Fast Fourier Transform (FFT) on a complex array.
+ * @param x The input array of complex numbers to be transformed. The result is stored in the same array.
+ */
+void fft(CArray& x) {
+  const size_t N = x.size();
+  if (N <= 1) return;
+
+  CArray even = x[std::slice(0, N / 2, 2)];
+  CArray odd  = x[std::slice(1, N / 2, 2)];
+
+  fft(even);
+  fft(odd);
+
+  for (size_t k = 0; k < N / 2; ++k) {
+    auto t       = std::polar(1.0, -2.0 * M_PI * k / N) * odd[k];
+    x[k]         = even[k] + t;
+    x[k + N / 2] = even[k] - t;
+  }
+}
+
+/**
+ * @brief Encodes a sequence into a numerical vector based on the specified scoring mode. For protein sequences, it uses the Kyte-Doolittle hydrophobicity scale, and for DNA sequences, it uses a binary encoding for purines and pyrimidines.
+ *
+ * @param seq The input sequence to be encoded.
+ * @param mode The scoring mode (DNA or Protein) that determines the encoding scheme.
+ * @return A vector of doubles representing the encoded sequence.
+ */
+std::vector<double> encodeSequence(const std::string& seq, ScoreMode mode) {
+  // Hydrophobicity (Kyte-Doolittle) for protein
+  static const std::array<double, 256> hydro = []() {
+    std::array<double, 256> h{};
+    h['A'] = 1.8;
+    h['R'] = -4.5;
+    h['N'] = -3.5;
+    h['D'] = -3.5;
+    h['C'] = 2.5;
+    h['Q'] = -3.5;
+    h['E'] = -3.5;
+    h['G'] = -0.4;
+    h['H'] = -3.2;
+    h['I'] = 4.5;
+    h['L'] = 3.8;
+    h['K'] = -3.9;
+    h['M'] = 1.9;
+    h['F'] = 2.8;
+    h['P'] = -1.6;
+    h['S'] = -0.8;
+    h['T'] = -0.7;
+    h['W'] = -0.9;
+    h['Y'] = -1.3;
+    h['V'] = 4.2;
+    return h;
+  }();
+  // Binary purine/pyrimidine for DNA
+  static const std::array<double, 256> purine = []() {
+    std::array<double, 256> p{};
+    p['A'] = 1.0;
+    p['G'] = 1.0;
+    p['C'] = -1.0;
+    p['T'] = -1.0;
+    p['U'] = -1.0;
+    return p;
+  }();
+
+  std::vector<double> enc(seq.size());
+  for (size_t i = 0; i < seq.size(); ++i)
+    enc[i] = (mode == MODE_PROTEIN) ? hydro[(unsigned char)seq[i]]
+                                    : purine[(unsigned char)seq[i]];
+  return enc;
+}
+
+/**
+ * @brief Computes the cross-correlation between two sequences using the Fast Fourier Transform (FFT). This function encodes the sequences based on the specified scoring mode, performs FFT-based convolution to compute the cross-correlation, and identifies the best offset and corresponding score.
+ *
+ * @param a The first input sequence.
+ * @param b The second input sequence.
+ * @param mode The scoring mode (DNA or Protein) that determines the encoding scheme for the sequences.
+ * @return A pair containing the best offset (shift) and the corresponding cross-correlation score.
+ */
+std::pair<int, double> fftCrossCorrelation(const std::string& a,
+                                           const std::string& b,
+                                           ScoreMode          mode) {
+  size_t N   = 1;
+  size_t len = a.size() + b.size();
+  while (N < len) N <<= 1;
+
+  auto ea = encodeSequence(a, mode);
+  auto eb = encodeSequence(b, mode);
+
+  CArray fa(N), fb(N);
+  for (size_t i = 0; i < ea.size(); ++i) fa[i] = ea[i];
+  for (size_t i = 0; i < eb.size(); ++i) fb[i] = eb[i];
+
+  fft(fa);
+  fft(fb);
+
+  CArray fc(N);
+  for (size_t i = 0; i < N; ++i) fc[i] = fa[i] * std::conj(fb[i]);
+
+  fc = fc.apply(std::conj);
+  fft(fc);
+  fc = fc.apply(std::conj);
+  for (auto& v : fc) v /= (double)N;
+
+  int    best_offset = 0;
+  double best_score  = -1e18;
+  for (size_t i = 0; i < N; ++i) {
+    if (fc[i].real() > best_score) {
+      best_score  = fc[i].real();
+      best_offset = (int)i;
+    }
+  }
+  // FFT offsets in [N/2, N) represent negative shifts
+  if (best_offset > (int)(N / 2)) best_offset -= (int)N;
+
+  return {best_offset, best_score};
+}
+
+/** @brief Sanitizes a FASTA header by replacing spaces with underscores.
+ * This is useful for ensuring that headers are valid identifiers in various
+ * contexts.
+ * @param header The header string to sanitize.
+ */
+void sanitize_header(std::string& header) {
+  for (char& c : header) {
+    if (isspace(static_cast<unsigned char>(c))) {
+      c = '_';
+    }
+  }
+}
+
+/**
+ * @brief Processes a FASTA file to extract the header and sequence.
+ * This function reads a FASTA file, extracts the first header line,
+ * and concatenates all sequence lines into a single uppercase string.
+ *
+ * @param fn The filename of the FASTA file.
+ * @param hdr Output parameter for the header (without '>' prefix).
+ * @param seq Output parameter for the sequence (uppercase, no gaps).
+ */
+void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
+  std::ifstream f(fn);
+  if (!f) throw std::runtime_error("Cannot open " + fn);
+  hdr.clear();
+  seq.clear();
+  std::string line;
+  bool        gotHdr = false;
+
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    if (line[0] == '>') {
+      if (!gotHdr) {  // only first header
+        hdr    = line.substr(1);
+        gotHdr = true;
+      }
+      continue;
+    }
+    // sanitize: for each char, if A–Z or a–z, convert to uppercase and append
+    for (char c : line) {
+      if (std::isalpha(static_cast<unsigned char>(c))) {
+        seq.push_back(std::toupper(static_cast<unsigned char>(c)));
+      }
+    }
+  }
 }
 
 /**
@@ -283,7 +477,7 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
   // final score
   int finalScore = Sp[n];
 
-  // scalar traceback: identical to your existing code
+  // traceback
   aligned_x.clear();
   aligned_y.clear();
   int i = m, j = n;
@@ -317,54 +511,6 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
   std::reverse(aligned_x.begin(), aligned_x.end());
   std::reverse(aligned_y.begin(), aligned_y.end());
   return finalScore;
-}
-
-/** @brief Sanitizes a FASTA header by replacing spaces with underscores.
- * This is useful for ensuring that headers are valid identifiers in various
- * contexts.
- * @param header The header string to sanitize.
- */
-void sanitize_header(std::string& header) {
-  for (char& c : header) {
-    if (isspace(static_cast<unsigned char>(c))) {
-      c = '_';
-    }
-  }
-}
-
-/**
- * @brief Processes a FASTA file to extract the header and sequence.
- * This function reads a FASTA file, extracts the first header line,
- * and concatenates all sequence lines into a single uppercase string.
- *
- * @param fn The filename of the FASTA file.
- * @param hdr Output parameter for the header (without '>' prefix).
- * @param seq Output parameter for the sequence (uppercase, no gaps).
- */
-void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
-  std::ifstream f(fn);
-  if (!f) throw std::runtime_error("Cannot open " + fn);
-  hdr.clear();
-  seq.clear();
-  std::string line;
-  bool        gotHdr = false;
-
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    if (line[0] == '>') {
-      if (!gotHdr) {  // only first header
-        hdr    = line.substr(1);
-        gotHdr = true;
-      }
-      continue;
-    }
-    // sanitize: for each char, if A–Z or a–z, convert to uppercase and append
-    for (char c : line) {
-      if (std::isalpha(static_cast<unsigned char>(c))) {
-        seq.push_back(std::toupper(static_cast<unsigned char>(c)));
-      }
-    }
-  }
 }
 
 /**
@@ -493,6 +639,12 @@ void projectGaps(const std::string& oldc, const std::string& newc,
 
 /**
  * @brief Compute identity‐based distance matrix in parallel.
+ * @param seqs The input sequences for which the distance matrix is to be computed.
+ * @param mode The scoring mode (DNA or Protein) that determines the scoring function used for pairwise alignments.
+ * @param fn The scoring function to use for pairwise alignments, which should be compatible with the specified scoring mode.
+ * @param p The alignment parameters containing gap penalties.
+ *
+ * @return A 2D vector representing the distance matrix, where D[i][j] is the distance between sequences i and j based on their global alignment identity.
  */
 std::vector<std::vector<double>> computeDistanceMatrix(
     const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
@@ -516,6 +668,373 @@ std::vector<std::vector<double>> computeDistanceMatrix(
     }
   }
   return D;
+}
+
+/**
+ * @brief Stores all optimal pairwise residue-pair positions for an input set.
+ *
+ * For every ordered pair (i, k) where i < k, @c lib[i][k] contains the set
+ * of (ungapped_pos_i, ungapped_pos_k) integer pairs that co-occur in the
+ * optimal global alignment of sequences i and k. This library is the
+ * foundation of the COFFEE Log-Expectation scoring used by
+ * calculate_le_score() and build_profile_le().
+ *
+ * @see buildPairLib(), calculate_le_score(), build_profile_le()
+ */
+struct PairLib {
+  int N;  ///< Number of input sequences.
+  /// @c lib[i][k] holds residue-pair positions from the optimal
+  /// pairwise alignment of sequences i and k (i < k only).
+  std::vector<std::vector<std::set<std::pair<int,int>>>> lib;
+};
+
+/**
+ * @brief Constructs the pairwise alignment library for a set of sequences.
+ *
+ * For every unique pair (i, k) with i < k, runs computeGlobalAlignment() and
+ * records every column where both sequences contribute a non-gap residue as a
+ * (ungapped_pos_i, ungapped_pos_k) pair in @c PairLib::lib[i][k].
+ *
+ * The outer loop is parallelised with @c schedule(dynamic) OpenMP. Individual
+ * insertions into the shared @c lib are protected by @c #pragma omp critical.
+ *
+ * Time complexity: O(N² × L²) for N sequences of average length L.
+ *
+ * @param seqs  Raw (ungapped) input sequences.
+ * @param mode  Scoring mode — @c MODE_DNA or @c MODE_PROTEIN.
+ * @param fn    Raw scoring function pointer compatible with @p mode.
+ * @param p     Alignment parameters (gap_open, gap_extend).
+ *
+ * @return A fully populated @c PairLib for @p seqs.
+ *
+ * @see PairLib, computeGlobalAlignment(), build_profile_le()
+ */
+PairLib buildPairLib(const std::vector<std::string>& seqs, ScoreMode mode,
+                     ScoreFn fn, const AlignParams& p) {
+  int     n = seqs.size();
+  PairLib pl;
+  pl.N = n;
+  pl.lib.assign(n, std::vector<std::set<std::pair<int, int>>>(n));
+
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < n; ++i) {
+    for (int k = i + 1; k < n; ++k) {
+      std::string ax, ay;
+      computeGlobalAlignment(seqs[i], seqs[k], mode, fn, ax, ay, p);
+
+      int pi = 0, pk = 0;
+      for (size_t j = 0; j < ax.size(); ++j) {
+        bool gi = (ax[j] == '-');
+        bool gk = (ay[j] == '-');
+        if (!gi && !gk) {
+#pragma omp critical
+          pl.lib[i][k].insert({pi, pk});
+        }
+        if (!gi) ++pi;
+        if (!gk) ++pk;
+      }
+    }
+  }
+  return pl;
+}
+
+/**
+ * @brief Computes a banded global alignment between two sequences using a modified Needleman-Wunsch algorithm. The band is centered around a seed offset, which can be determined by
+ * @param x The first sequence to be aligned.
+ * @param y The second sequence to be aligned.
+ * @param mode The scoring mode (DNA or Protein) that determines the scoring function used for
+ * @param fn The scoring function to use for matches/mismatches, which should be compatible with the specified scoring mode.
+ * @param aligned_x Output string for the aligned first sequence.
+ * @param aligned_y Output string for the aligned second sequence.
+ * @param p The alignment parameters containing gap penalties.
+ * @param seed_offset The diagonal offset around which the band is centered. A value of
+ * @param bandwidth The width of the band around the seed offset. Only cells within this band will be computed, which can significantly reduce computation time for similar sequences.
+ *
+ * @return The final alignment score for the best path found within the band. If the optimal alignment falls outside the band, the function will fall back to a full Needleman-Wunsch computation.
+ */
+int computeBandedAlignment(const std::string& x, const std::string& y,
+                           ScoreMode mode, ScoreFn fn, std::string& aligned_x,
+                           std::string& aligned_y, const AlignParams& p,
+                           int seed_offset, int bandwidth = 50) {
+  const int m       = x.size();
+  const int n       = y.size();
+  const int iOpen   = static_cast<int>(std::round(p.gap_open));
+  const int iExtend = static_cast<int>(std::round(p.gap_extend));
+
+  seed_offset = std::max(-(m - 1), std::min(n - 1, seed_offset));
+
+  std::vector<std::vector<int>>  S(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
+  std::vector<std::vector<int>>  E(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
+  std::vector<std::vector<int>>  F(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
+  std::vector<std::vector<char>> tr(m + 1, std::vector<char>(n + 1, '?'));
+
+  S[0][0]  = 0;
+  tr[0][0] = 'M';
+  for (int j = 1; j <= n; ++j) {
+    int diag = -j;
+    if (diag >= seed_offset - bandwidth && diag <= seed_offset + bandwidth) {
+      E[0][j]  = (j == 1) ? iOpen + iExtend : E[0][j - 1] + iExtend;
+      S[0][j]  = E[0][j];
+      tr[0][j] = (j == 1 ? 'E' : 'e');
+    }
+  }
+  for (int i = 1; i <= m; ++i) {
+    int diag = i;
+    if (diag >= seed_offset - bandwidth && diag <= seed_offset + bandwidth) {
+      F[i][0]  = (i == 1) ? iOpen + iExtend : F[i - 1][0] + iExtend;
+      S[i][0]  = F[i][0];
+      tr[i][0] = (i == 1 ? 'F' : 'f');
+    }
+  }
+
+  for (int i = 1; i <= m; ++i) {
+    for (int j = 1; j <= n; ++j) {
+      int diag = j - i - seed_offset;
+      if (std::abs(diag) > bandwidth) continue;
+
+      int prev =
+          (S[i - 1][j - 1] > INT_MIN / 2) ? S[i - 1][j - 1] : INT_MIN / 2;
+      int match_score =
+          (prev > INT_MIN / 2) ? prev + fn(x[i - 1], y[j - 1]) : INT_MIN / 2;
+
+      E[i][j] = std::max(
+          (S[i][j - 1] > INT_MIN / 2) ? S[i][j - 1] + iOpen : INT_MIN / 2,
+          (E[i][j - 1] > INT_MIN / 2) ? E[i][j - 1] + iExtend : INT_MIN / 2);
+      F[i][j] = std::max(
+          (S[i - 1][j] > INT_MIN / 2) ? S[i - 1][j] + iOpen : INT_MIN / 2,
+          (F[i - 1][j] > INT_MIN / 2) ? F[i - 1][j] + iExtend : INT_MIN / 2);
+      S[i][j] = std::max({match_score, E[i][j], F[i][j]});
+
+      if (S[i][j] == match_score)
+        tr[i][j] = 'M';
+      else if (S[i][j] == E[i][j])
+        tr[i][j] = 'E';
+      else
+        tr[i][j] = 'F';
+    }
+  }
+
+  // if band missed the endpoint, fall back to full NW
+  if (S[m][n] <= INT_MIN / 2) {
+    return computeGlobalAlignment(x, y, mode, fn, aligned_x, aligned_y, p);
+  }
+
+  // Traceback
+  aligned_x.clear();
+  aligned_y.clear();
+  int i = m, j = n;
+  while (i > 0 || j > 0) {
+    char t = tr[i][j];
+    if (t == 'M') {
+      aligned_x += x[i - 1];
+      aligned_y += y[j - 1];
+      --i;
+      --j;
+    } else if (t == 'F' || t == 'f') {
+      aligned_x += x[i - 1];
+      aligned_y += '-';
+      --i;
+    } else if (t == 'E' || t == 'e') {
+      aligned_x += '-';
+      aligned_y += y[j - 1];
+      --j;
+    } else {
+      if (i > 0) {
+        aligned_x += x[i - 1];
+        aligned_y += '-';
+        --i;
+      } else {
+        aligned_x += '-';
+        aligned_y += y[j - 1];
+        --j;
+      }
+    }
+  }
+  std::reverse(aligned_x.begin(), aligned_x.end());
+  std::reverse(aligned_y.begin(), aligned_y.end());
+  return S[m][n];
+}
+
+/**
+ * @brief Builds a progressive MSA profile using FFT-seeded banded alignment.
+ *
+ * Recursively traverses the UPGMA guide tree. At each internal node, it
+ * generates a consensus sequence for each child profile, uses FFT
+ * cross-correlation (fftCrossCorrelation()) to estimate the best diagonal
+ * offset between the two consensus sequences, and then performs a banded
+ * Needleman-Wunsch alignment (computeBandedAlignment()) centred on that
+ * offset. The resulting gap pattern is projected back into all sequences of
+ * each child profile via projectGaps(), and the two profiles are merged.
+ *
+ * Compared to the plain progressive NW aligner (build_profile()), this method
+ * is faster on long, similar sequences because the band restricts the DP to
+ * O(L * bandwidth) cells instead of O(L^2). For short or highly diverged
+ * sequences the banded aligner falls back automatically to full NW.
+ *
+ * @param n     Pointer to the current node in the binary guide tree.
+ *              Leaf nodes must have their @c profile field pre-seeded with
+ *              the single raw sequence (done by @c make_tree in main()).
+ *              Pass @c nullptr to get an empty result.
+ * @param mode  Scoring mode — @c MODE_DNA uses the EDNAFULL matrix,
+ *              @c MODE_PROTEIN uses BLOSUM62.
+ * @param fn    Raw scoring function pointer compatible with @p mode
+ *              (e.g. @c edna_score or @c blosum62_score).
+ * @param p     Alignment parameters (gap_open, gap_extend).
+ *
+ * @return A @c std::vector<std::string> where every string is the same
+ *         length, representing the column-aligned sequences rooted at @p n.
+ *         Returns an empty vector if @p n is @c nullptr.
+ *
+ * @note This function is not thread-safe when called concurrently on nodes
+ *       that share child pointers. In main(), three independent trees are
+ *       parsed so each @c #pragma omp section owns its own tree.
+ *
+ * @see fftCrossCorrelation(), computeBandedAlignment(), projectGaps(),
+ *      build_profile(), build_profile_le()
+ */
+std::vector<std::string> build_profile_fft(Node* n, ScoreMode mode, ScoreFn fn,
+                                           const AlignParams& p) {
+  if (!n) return {};
+  if (n->leaf) return {/* raw seq loaded externally — see wire-up below */};
+
+  auto A = build_profile_fft(n->left, mode, fn, p);
+  auto B = build_profile_fft(n->right, mode, fn, p);
+
+  std::string consA = generate_consensus(A);
+  std::string consB = generate_consensus(B);
+
+  // Get FFT seed offset
+  auto [offset, corr] = fftCrossCorrelation(consA, consB, mode);
+
+  std::string aligned_consA, aligned_consB;
+  int bw = std::max(50, (int)(std::max(consA.size(), consB.size()) / 4));
+  computeBandedAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB,
+                         p, offset, bw);
+
+  projectGaps(consA, aligned_consA, A);
+  projectGaps(consB, aligned_consB, B);
+
+  std::vector<std::string> merged = A;
+  merged.insert(merged.end(), B.begin(), B.end());
+  return merged;
+}
+
+/**
+ * @brief Merges two MSA profiles using NW on their consensus sequences,
+ *        guided by a pairwise alignment library (COFFEE LE approach).
+ *
+ * Generates a consensus for each profile, aligns the two consensus sequences
+ * with computeGlobalAlignment(), projects the resulting gaps back into all
+ * sequences of each group via projectGaps(), and concatenates the groups into
+ * a single merged profile.
+ *
+ * @param A      Profile for the left  child group — modified in-place to
+ *               insert gap columns; pass a local copy if the original must
+ *               be preserved.
+ * @param B      Profile for the right child group — same in-place semantics.
+ * @param pl     Pairwise alignment library built by buildPairLib().
+ *               Reserved for future LE-aware column scoring; currently the
+ *               alignment step uses standard NW.
+ * @param idx_A  Original sequence indices (into the full input @c seqs
+ *               vector) for every sequence in profile @p A.
+ * @param idx_B  Original sequence indices for every sequence in profile @p B.
+ * @param mode   Scoring mode — @c MODE_DNA or @c MODE_PROTEIN.
+ * @param fn     Raw scoring function pointer compatible with @p mode.
+ * @param p      Alignment parameters (gap_open, gap_extend).
+ *
+ * @return A merged @c std::vector<std::string> containing all sequences from
+ *         @p A followed by all sequences from @p B, column-aligned.
+ *
+ * @see buildPairLib(), build_profile_le(), projectGaps(),
+ *      computeGlobalAlignment()
+ */
+std::vector<std::string> merge_profiles_le(
+    std::vector<std::string>& A,
+    std::vector<std::string>& B,
+    const PairLib&             pl,
+    const std::vector<int>&    idx_A,
+    const std::vector<int>&    idx_B,
+    ScoreMode mode, ScoreFn fn, const AlignParams& p) {
+  std::string consA = generate_consensus(A);
+  std::string consB = generate_consensus(B);
+
+  // Use standard NW on consensus to get the column structure
+  std::string aligned_consA, aligned_consB;
+  computeGlobalAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB,
+                         p);
+
+  projectGaps(consA, aligned_consA, A);
+  projectGaps(consB, aligned_consB, B);
+
+  std::vector<std::string> merged = A;
+  merged.insert(merged.end(), B.begin(), B.end());
+  return merged;
+}
+
+/**
+ * @brief Result node for the LE-guided profile builder.
+ *
+ * Pairs an aligned profile (a set of equal-length strings) with the original
+ * sequence indices that contributed to it. The index bookkeeping is required
+ * by merge_profiles_le() to look up residue pairs in the PairLib.
+ */
+struct LENode {
+  std::vector<std::string> profile;      ///< Column-aligned sequences at this node.
+  std::vector<int>         seq_indices;  ///< Indices into the original @c seqs vector.
+};
+
+/**
+ * @brief Builds a progressive MSA profile using COFFEE Log-Expectation (LE)
+ *        guided merging.
+ *
+ * Recursively traverses the UPGMA guide tree. At each internal node it calls
+ * merge_profiles_le() to merge the left and right child profiles, passing
+ * along the original sequence index lists so the pairwise library can be
+ * consulted during column scoring.
+ *
+ * This method is designed to reward column pairings that are consistent with
+ * the pre-computed pairwise alignments stored in @p pl, following the
+ * T-Coffee / COFFEE objective.
+ *
+ * @param n        Pointer to the current node in the binary guide tree.
+ *                 Leaf nodes are initialised directly from @p raw_seqs using
+ *                 @c n->seq_index. Pass @c nullptr to get an empty result.
+ * @param raw_seqs The original, ungapped input sequences indexed by their
+ *                 position in the input file list.
+ * @param pl       Pairwise alignment library produced by buildPairLib().
+ *                 Contains every optimal pairwise residue-pair for all
+ *                 (i, k) combinations.
+ * @param mode     Scoring mode — @c MODE_DNA or @c MODE_PROTEIN.
+ * @param fn       Raw scoring function pointer compatible with @p mode.
+ * @param p        Alignment parameters (gap_open, gap_extend).
+ *
+ * @return An @c LENode containing the merged, column-aligned profile and the
+ *         full list of original sequence indices under this node.
+ *         Returns a default-constructed (empty) @c LENode if @p n is
+ *         @c nullptr.
+ *
+ * @see merge_profiles_le(), buildPairLib(), LENode, build_profile(),
+ *      build_profile_fft()
+ */
+LENode build_profile_le(Node* n, const std::vector<std::string>& raw_seqs,
+                        const PairLib& pl, ScoreMode mode, ScoreFn fn,
+                        const AlignParams& p) {
+  if (!n) return {};
+  if (n->leaf) {
+    return {{raw_seqs[n->seq_index]}, {n->seq_index}};
+  }
+
+  auto L = build_profile_le(n->left, raw_seqs, pl, mode, fn, p);
+  auto R = build_profile_le(n->right, raw_seqs, pl, mode, fn, p);
+
+  auto merged_seqs = merge_profiles_le(L.profile, R.profile, pl, L.seq_indices,
+                                       R.seq_indices, mode, fn, p);
+
+  std::vector<int> merged_idx = L.seq_indices;
+  merged_idx.insert(merged_idx.end(), R.seq_indices.begin(),
+                    R.seq_indices.end());
+
+  return {merged_seqs, merged_idx};
 }
 
 /**
@@ -743,12 +1262,12 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa,
   std::vector<std::string> global_best_msa = initial_msa;
   long long                global_best_score =
       calculate_sp_score(global_best_msa, mode, fn, p);
-  std::cout << "Initial MSA score: " << global_best_score << std::endl;
+  // std::cout << "MSA score: " << global_best_score << std::endl;
 
   for (int r = 0; r < rounds; ++r) {
-    std::cout << "\n--- Starting Refinement Round " << r + 1 << "/" << rounds
-              << " (Best score so far: " << global_best_score << ") ---"
-              << std::endl;
+    // std::cout << "\n--- Starting Refinement Round " << r + 1 << "/" << rounds
+    //           << " (Best score so far: " << global_best_score << ") ---"
+    //           << std::endl;
 
     int                                   num_threads = omp_get_max_threads();
     std::vector<std::vector<std::string>> thread_results(num_threads);
@@ -778,9 +1297,7 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa,
     }
   }
 
-  std::cout << "\nFinished Iterative refinement. Final score: "
-            << global_best_score << "\n\n"
-            << std::endl;
+  std::cout << "\nMSA Score: " << global_best_score << "\n\n" << std::endl;
   return global_best_msa;
 }
 
@@ -1012,14 +1529,6 @@ std::vector<std::string> msa_star(const std::vector<std::string>& hdrs,
   return aligned;
 }
 
-// a tiny binary tree node for your guide‐tree
-struct Node {
-  bool                     leaf;
-  int                      seq_index;  // which original sequence, if leaf
-  std::vector<std::string> profile;    // current MSA block under this node
-  Node *                   left = nullptr, *right = nullptr;
-};
-
 /**
  * @brief Parses a Newick formatted tree string into a binary tree structure.
  * This function constructs a binary tree from a Newick string, where each leaf
@@ -1218,33 +1727,48 @@ std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn,
   return n->profile;
 }
 
-// A simple struct to hold the results of our search
+/**
+ * @brief Holds the result of a gap-penalty grid search.
+ */
 struct GapSearchResult {
-  long long score      = -__LONG_LONG_MAX__;
-  double    gap_open   = 0.0;
-  double    gap_extend = 0.0;
+  long long score      = -LLONG_MAX; ///< Best SP score found across all parameter combos.
+  double    gap_open   = 0.0;        ///< Gap-open penalty that achieved @c score.
+  double    gap_extend = 0.0;        ///< Gap-extend penalty that achieved @c score.
 };
 
-// ADD THIS — recursive tree deallocator
-void free_tree(Node* n) {
-  if (!n) return;
-  free_tree(n->left);
-  free_tree(n->right);
-  delete n;
-}
-
 /**
- * @brief Searches for the optimal gap penalties in parallel.
- * This function performs a grid search over a range of gap open and extend
- * penalties, building a complete MSA for each combination and returning the
- * best scoring one.
+ * @brief Performs a parallel grid search to find optimal affine gap penalties.
  *
- * @param initial_seqs The initial sequences to align.
- * @param initial_hdrs The headers corresponding to the initial sequences.
- * @param mode The scoring mode (DNA or Protein).
- * @param fn The scoring function to use.
- * @return A GapSearchResult containing the best score and corresponding gap
- * penalties.
+ * Evaluates a fixed grid of (gap_open × gap_extend) combinations. For each
+ * combination it:
+ *   -# Computes the full pairwise distance matrix with computeDistanceMatrix().
+ *   -# Builds a UPGMA guide tree with buildUPGMATree().
+ *   -# Constructs a progressive MSA with build_profile().
+ *   -# Scores the MSA with calculate_sp_score().
+ *
+ * The search runs with @c collapse(2) OpenMP parallelism — each
+ * (i, j) grid cell is a completely independent task with its own
+ * stack-allocated @c AlignParams, so there is no shared mutable state and
+ * no data races.
+ *
+ * Default grid:
+ *   - @c gap_open   : -25.0, -22.5, …, -10.0 (7 values, step 2.5)
+ *   - @c gap_extend :  -5.0,  -4.0, …,  -1.0 (5 values, step 1.0)
+ *
+ * @param initial_seqs  Raw (ungapped) input sequences.
+ * @param initial_hdrs  Sequence headers corresponding to @p initial_seqs.
+ *                      Used as node labels in the guide tree.
+ * @param mode          Scoring mode — @c MODE_DNA or @c MODE_PROTEIN.
+ * @param fn            Raw scoring function pointer compatible with @p mode.
+ *
+ * @return A @c GapSearchResult with the best SP score and the corresponding
+ *         gap penalties.
+ *
+ * @note Each grid point allocates and immediately frees a full guide tree
+ *       (via free_tree()). Memory usage is O(N) per thread at any one time.
+ *
+ * @see computeDistanceMatrix(), buildUPGMATree(), build_profile(),
+ *      calculate_sp_score(), GapSearchResult, AlignParams
  */
 GapSearchResult find_optimal_gap_penalties(
     const std::vector<std::string>& initial_seqs,
@@ -1306,18 +1830,31 @@ GapSearchResult find_optimal_gap_penalties(
     }
   }
 
-  std::cout << "\n--- Finished parameter search ---" << std::endl;
+  // std::cout << "\n--- Finished parameter search ---" << std::endl;
   return best_result;
 }
 
 /**
- * @brief Analyzes a final MSA to find positional matches for the consensus
- * sequence and saves the consensus and a detailed report to files.
+ * @brief Analyses a final MSA for per-column consensus matches and writes a
+ *        detailed report and a FASTA consensus file to disk.
  *
- * @param msa The final multiple sequence alignment.
- * @param hdrs A vector of the original sequence headers.
- * @param consensus_seq The pre-computed consensus sequence of the MSA.
- * @param outdir The directory where the output files will be saved.
+ * Iterates over every column of the alignment. For columns where the consensus
+ * character is not a gap, it reports which sequences carry a matching residue
+ * together with that residue's 1-based position in the original (ungapped)
+ * sequence. Output files:
+ *   - @c <outdir>/consensus.fasta  — FASTA-formatted consensus sequence.
+ *   - @c <outdir>/consensus_details.txt — per-column match report.
+ *
+ * @param msa           The final column-aligned MSA produced by refine_msa().
+ * @param hdrs          Original sequence headers, one per row in @p msa.
+ * @param consensus_seq Pre-computed consensus string from generate_consensus().
+ *                      Must be the same length as every row of @p msa.
+ * @param outdir        Output directory path (must already exist).
+ *
+ * @pre  @p msa is non-empty and all rows have equal length.
+ * @pre  @p consensus_seq.size() == @p msa[0].size().
+ *
+ * @see generate_consensus(), refine_msa()
  */
 void analyze_and_save_consensus(const std::vector<std::string>& msa,
                                 const std::vector<std::string>& hdrs,
@@ -1503,7 +2040,7 @@ int main(int argc, char** argv) {
               << " with score: " << best.score << "\n"
               << std::endl;
   } else {
-    std::cout << "\nUsing user-supplied: GAP_OPEN=" << params.gap_open
+    std::cout << "\nGAP_OPEN=" << params.gap_open
               << ", GAP_EXTEND=" << params.gap_extend << "\n"
               << std::endl;
   }
@@ -1520,66 +2057,120 @@ int main(int argc, char** argv) {
   std::ofstream tf(outdir + "/guide_tree.nwk");
   tf << nwk_formatted;  // The formatted string already contains newlines
   tf.close();
+  // ── 7) Build pairwise library once (shared by all three methods) ────────
+  // std::cout << "\nBuilding pairwise library for LE scoring..." << std::endl;
+  auto pl = buildPairLib(seqs, mode, fn, params);
+  // std::cout << "Pairwise library built.\n" << std::endl;
 
-  // 7) Progressive MSA by walking the UPGMA tree
-  //    build a binary‐tree of Nodes from the Newick
-  Node* root = parseNewick(nwk, hdrs);
-
-  //    seed each leaf with its raw sequence
-  std::queue<Node*> q;
-  if (root) q.push(root);  // Push only if the root is valid
-  while (!q.empty()) {
-    Node* u = q.front();
-    q.pop();
-    if (!u) continue;  // Skip if a null pointer somehow got on the queue
-
-    if (u->leaf) {
-      // Verify the index is valid before accessing the 'seqs' vector.
-      if (u->seq_index < 0 || u->seq_index >= seqs.size()) {
-        std::cerr << "\nFATAL LOGIC ERROR: Invalid sequence index "
-                  << u->seq_index
-                  << " detected for a leaf node. Cannot retrieve sequence."
-                  << std::endl;
-        return 1;
+  // ── 8) Helper: parse tree + seed leaves (reused three times) ────────────
+  auto make_tree = [&]() -> Node* {
+    Node*             root = parseNewick(nwk, hdrs);
+    std::queue<Node*> q;
+    if (root) q.push(root);
+    while (!q.empty()) {
+      Node* u = q.front();
+      q.pop();
+      if (!u) continue;
+      if (u->leaf) {
+        if (u->seq_index < 0 || u->seq_index >= (int)seqs.size()) {
+          std::cerr << "\nFATAL LOGIC ERROR: Invalid seq_index " << u->seq_index
+                    << std::endl;
+          return nullptr;
+        }
+        u->profile = {seqs[u->seq_index]};
+      } else {
+        if (u->left) q.push(u->left);
+        if (u->right) q.push(u->right);
       }
-      u->profile = {seqs[u->seq_index]};
-    } else {
-      // Push children only if they are not null
-      if (u->left) q.push(u->left);
-      if (u->right) q.push(u->right);
+    }
+    return root;
+  };
+
+  // ── 9) Run all three aligners in parallel ───────────────────────────────
+  std::vector<std::string> msa_nw, msa_fft, msa_le;
+  long long                score_nw  = LLONG_MIN;
+  long long                score_fft = LLONG_MIN;
+  long long                score_le  = LLONG_MIN;
+
+#pragma omp parallel sections
+  {
+// ── Section 1: Progressive NW (existing method) ─────────────────────
+#pragma omp section
+    {
+      Node* root_nw = make_tree();
+      if (root_nw) {
+        msa_nw   = build_profile(root_nw, mode, fn, params);
+        score_nw = calculate_sp_score(msa_nw, mode, fn, params);
+        free_tree(root_nw);
+      }
+      // std::cout << "[NW]  SP score: " << score_nw << std::endl;
+    }
+
+// ── Section 2: FFT-seeded banded alignment ───────────────────────────
+#pragma omp section
+    {
+      Node* root_fft = make_tree();
+      if (root_fft) {
+        msa_fft   = build_profile_fft(root_fft, mode, fn, params);
+        score_fft = calculate_sp_score(msa_fft, mode, fn, params);
+        free_tree(root_fft);
+      }
+      // std::cout << "[FFT] SP score: " << score_fft << std::endl;
+    }
+
+// ── Section 3: COFFEE LE-guided alignment ────────────────────────────
+#pragma omp section
+    {
+      Node* root_le = make_tree();
+      if (root_le) {
+        auto le_result = build_profile_le(root_le, seqs, pl, mode, fn, params);
+        msa_le         = le_result.profile;
+        score_le       = calculate_sp_score(msa_le, mode, fn, params);
+        free_tree(root_le);
+      }
+      // std::cout << "[LE]  SP score: " << score_le << std::endl;
     }
   }
 
-  // recursively build the full MSA
-  auto msa = build_profile(root, mode, fn, params);
-  free_tree(root);  // Clean up the tree to prevent memory leaks
+  // ── 10) Select best initial alignment ───────────────────────────────────
+  std::vector<std::string> msa;
+  std::string              best_method;
 
-  // Refine the MSA using multiple threads over several rounds
-  int total_rounds = 3;
-  int iterations_per_thread_per_round =
-      10;  // Total work = rounds * iterations * num_threads
+  if (score_nw >= score_fft && score_nw >= score_le) {
+    msa         = std::move(msa_nw);
+    best_method = "Progressive NW";
+  } else if (score_fft >= score_nw && score_fft >= score_le) {
+    msa         = std::move(msa_fft);
+    best_method = "FFT-Seeded Banded";
+  } else {
+    msa         = std::move(msa_le);
+    best_method = "COFFEE LE-Guided";
+  }
+
+  // std::cout << "\n>>> Best initial alignment: " << best_method
+  //           << " (score: " << std::max({score_nw, score_fft, score_le})
+  //           << ")\n" << std::endl;
+
+  // ── 11) Iterative refinement on the winner ───────────────────────────────
+  int total_rounds                    = 3;
+  int iterations_per_thread_per_round = 10;
   msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn,
                    params);
 
-  // 10) Print and save colored MSA
+  // ── 12) Print and save colored MSA ──────────────────────────────────────
   printColorMSA(msa);
   saveMSA_to_HTML(msa, hdrs, outdir);
 
-  // 11) Analyze and Save Consensus Sequence
-  // First, generate the final consensus sequence from the final MSA
-  std::string final_consensus = generate_consensus(msa);
-  // Second, write the simple consensus sequence to a FASTA file
+  // ── 13) Analyze and save consensus ──────────────────────────────────────
+  std::string   final_consensus = generate_consensus(msa);
   std::ofstream cf(outdir + "/consensus.fasta");
   cf << ">consensus\n" << final_consensus << "\n";
   cf.close();
-  // Third, create the detailed report of positional matches
   analyze_and_save_consensus(msa, hdrs, final_consensus, outdir);
 
-  // 12) Write out main MSA in FASTA format
+  // ── 14) Write MSA in FASTA format ───────────────────────────────────────
   std::ofstream mf(outdir + "/msa.fasta");
-  for (int i = 0; i < n; ++i) {
-    mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
-  }
+  for (int i = 0; i < n; ++i) mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
   mf.close();
 
   return 0;
