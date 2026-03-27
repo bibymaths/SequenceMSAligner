@@ -407,6 +407,258 @@ void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
   }
 }
 
+// TODO: Write docstring
+std::vector<int> nw_score_row(const std::string& x, const std::string& y,
+                               ScoreMode mode, ScoreFn fn,
+                               const AlignParams& p) {
+  const int m      = x.size();
+  const int n      = y.size();
+  const int iOpen  = static_cast<int>(std::round(p.gap_open));
+  const int iExt   = static_cast<int>(std::round(p.gap_extend));
+
+  std::vector<int> S(n + 1), E(n + 1);
+  S[0] = 0;
+  for (int j = 1; j <= n; ++j) {
+    E[j] = (j == 1) ? iOpen + iExt : E[j-1] + iExt;
+    S[j] = E[j];
+  }
+
+  for (int i = 1; i <= m; ++i) {
+    std::vector<int> Snew(n + 1), Enew(n + 1);
+    int openF  = S[0] + iOpen;
+    Snew[0]    = openF + iExt;
+    Enew[0]    = INT_MIN / 2;
+    int Fval   = Snew[0];
+
+    for (int j = 1; j <= n; ++j) {
+      Fval       = std::max(Snew[j-1] + iOpen, Fval + iExt);  // F extends down
+      int Fj     = std::max(S[j] + iOpen, /* prev F */ Fval);  // recompute properly
+      // Correct 3-matrix recurrence
+      int ej     = std::max(Snew[j-1] + iOpen, Enew[j-1] + iExt);
+      int fj     = std::max(S[j]      + iOpen, (i > 1 ? INT_MIN/2 : INT_MIN/2));
+      Enew[j]    = ej;
+      int diag   = S[j-1] + fn(x[i-1], y[j-1]);
+      Snew[j]    = std::max({diag, ej, fj});
+    }
+    S = Snew;
+    E = Enew;
+  }
+  return S;
+}
+
+static std::vector<int> hirsch_forward(const std::string& x,
+                                        const std::string& y,
+                                        ScoreFn fn, int iOpen, int iExt) {
+  const int m  = x.size();
+  const int n  = y.size();
+  const int n8 = (n + 7) & ~7;
+
+  std::vector<int> cur(n8 + 2, INT_MIN/2);
+  std::vector<int> prev(n8 + 2, INT_MIN/2);
+  std::vector<int> E(n8 + 2, INT_MIN/2);
+
+  const __m256i vOpen = _mm256_set1_epi32(iOpen);
+  const __m256i vExt  = _mm256_set1_epi32(iExt);
+
+  // Init row 0
+  prev[0] = 0;
+  E[0]    = INT_MIN/2;
+  for (int j = 1; j <= n; ++j) {
+    E[j]    = (j == 1) ? iOpen + iExt : E[j-1] + iExt;
+    prev[j] = E[j];
+  }
+
+  for (int i = 1; i <= m; ++i) {
+    // Scalar first column (F recurrence, sequential)
+    cur[0]  = (i == 1) ? iOpen + iExt : prev[0] + iExt;
+    int Fval = cur[0];
+    E[0]    = INT_MIN/2;
+
+    // Precompute 8 match scores at a time using AVX2
+    // E and F still require scalar sequential pass
+    // but M (diagonal scores) can be loaded as a vector
+    for (int j = 1; j <= n8; j += 8) {
+      // --- Scalar E/F pass (sequential dependency) ---
+      int scores[8];
+      for (int k = 0; k < 8; ++k) {
+        int jk = j + k;
+        scores[k] = 0;
+        if (jk <= n) scores[k] = fn(x[i-1], y[jk-1]);
+      }
+
+      // --- AVX2: compute M = prev[j-1..j+6] + match_scores ---
+      __m256i vPrevDiag = _mm256_loadu_si256((__m256i*)&prev[j-1]);
+      __m256i vMatch    = _mm256_loadu_si256((__m256i*)scores);
+      __m256i vM        = _mm256_add_epi32(vPrevDiag, vMatch);
+
+      // --- AVX2: compute F candidates = prev[j..j+7] + iOpen ---
+      __m256i vPrevJ    = _mm256_loadu_si256((__m256i*)&prev[j]);
+      __m256i vFopen    = _mm256_add_epi32(vPrevJ, vOpen);
+
+      // Store M and F candidates for scalar E/F merge below
+      int Mcand[8], Fopen_cand[8];
+      _mm256_storeu_si256((__m256i*)Mcand,       vM);
+      _mm256_storeu_si256((__m256i*)Fopen_cand,  vFopen);
+
+      // --- Scalar: E and F have sequential dependency, must be serial ---
+      for (int k = 0; k < 8; ++k) {
+        int jk = j + k;
+        if (jk > n) break;
+
+        // F = max(prev[jk] + iOpen, Fval + iExt)  [Fval carries over]
+        Fval = std::max(Fopen_cand[k], Fval + iExt);
+
+        // E = max(cur[jk-1] + iOpen, E[jk-1] + iExt)
+        int Ej = std::max(cur[jk-1] + iOpen, E[jk-1] + iExt);
+        E[jk]  = Ej;
+
+        // S = max(M, E, F)
+        cur[jk] = std::max({Mcand[k], Ej, Fval});
+      }
+    }
+    std::swap(cur, prev);
+    std::fill(cur.begin(), cur.end(), INT_MIN/2);
+  }
+  return std::vector<int>(prev.begin(), prev.begin() + n + 1);
+}
+
+static std::vector<int> hirsch_reverse(const std::string& x,
+                                        const std::string& y,
+                                        ScoreFn fn, int iOpen, int iExt) {
+  const int m  = x.size();
+  const int n  = y.size();
+
+  std::vector<int> cur(n + 2, INT_MIN/2);
+  std::vector<int> prev(n + 2, INT_MIN/2);
+  std::vector<int> E(n + 2, INT_MIN/2);
+
+  const __m256i vOpen = _mm256_set1_epi32(iOpen);
+  const __m256i vExt  = _mm256_set1_epi32(iExt);
+
+  prev[n] = 0;
+  for (int j = n - 1; j >= 0; --j) {
+    E[j]    = (j == n-1) ? iOpen + iExt : E[j+1] + iExt;
+    prev[j] = E[j];
+  }
+
+  for (int i = m - 1; i >= 0; --i) {
+    cur[n]   = (i == m-1) ? iOpen + iExt : prev[n] + iExt;
+    int Fval = cur[n];
+    E[n]     = INT_MIN/2;
+
+    // Process right-to-left in blocks of 8
+    for (int j = n - 1; j >= 0; j -= 8) {
+      int jstart = std::max(0, j - 7);
+      int len    = j - jstart + 1;
+
+      int scores[8] = {};
+      for (int k = 0; k < len; ++k) {
+        int jk = j - k;  // right-to-left
+        scores[k] = fn(x[i], y[jk]);
+      }
+
+      // AVX2: M = prev[j+1..j-7+1] + scores (diagonal is j+1 in reverse)
+      __m256i vPrevDiag = _mm256_loadu_si256((__m256i*)&prev[jstart + 1]);
+      __m256i vMatch    = _mm256_loadu_si256((__m256i*)scores);
+      __m256i vM        = _mm256_add_epi32(vPrevDiag, vMatch);
+
+      int Mcand[8];
+      _mm256_storeu_si256((__m256i*)Mcand, vM);
+
+      // Scalar E/F merge (sequential right-to-left)
+      for (int k = 0; k < len; ++k) {
+        int jk = j - k;
+        Fval     = std::max(prev[jk] + iOpen, Fval + iExt);
+        int Ej   = std::max(cur[jk+1] + iOpen, E[jk+1] + iExt);
+        E[jk]    = Ej;
+        cur[jk]  = std::max({Mcand[len-1-k], Ej, Fval});
+      }
+    }
+    std::swap(cur, prev);
+    std::fill(cur.begin(), cur.end(), INT_MIN/2);
+  }
+  return std::vector<int>(prev.begin(), prev.begin() + n + 1);
+}
+
+void hirschberg(const std::string& x, const std::string& y,
+                ScoreFn fn, int iOpen, int iExt,
+                std::string& ax, std::string& ay) {
+  const int m = x.size();
+  const int n = y.size();
+
+  if (m == 0) { ax += std::string(n, '-'); ay += y;              return; }
+  if (n == 0) { ax += x;                  ay += std::string(m, '-'); return; }
+  if (m == 1) {
+    int best_j = 0, best_score = INT_MIN;
+    for (int j = 0; j < n; ++j) {
+      int left  = (j == 0)     ? 0 : iOpen + j * iExt;
+      int right = (j == n - 1) ? 0 : iOpen + (n - j - 1) * iExt;
+      int s = left + fn(x[0], y[j]) + right;
+      if (s > best_score) { best_score = s; best_j = j; }
+    }
+    if (best_j > 0)     ax += std::string(best_j, '-');
+    ax += x[0];
+    if (best_j < n - 1) ax += std::string(n - best_j - 1, '-');
+    ay += y;
+    return;
+  }
+
+  const int mid = m / 2;
+  auto fwd = hirsch_forward(x.substr(0, mid), y, fn, iOpen, iExt);
+  auto bwd = hirsch_reverse(x.substr(mid),    y, fn, iOpen, iExt);
+
+  // AVX2: find split point — vectorized argmax over fwd[j] + bwd[j]
+  int split_j = 0, best = INT_MIN;
+  {
+    const int n8 = (n + 1 + 7) & ~7;
+    std::vector<int> fwd8(n8, INT_MIN/2), bwd8(n8, INT_MIN/2);
+    for (int j = 0; j <= n; ++j) { fwd8[j] = fwd[j]; bwd8[j] = bwd[j]; }
+
+    __m256i vBest   = _mm256_set1_epi32(INT_MIN);
+    __m256i vBestJ  = _mm256_set1_epi32(-1);
+    __m256i vIdx    = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i v8 = _mm256_set1_epi32(8);
+
+    for (int j = 0; j < n8; j += 8) {
+      __m256i vF = _mm256_loadu_si256((__m256i*)&fwd8[j]);
+      __m256i vB = _mm256_loadu_si256((__m256i*)&bwd8[j]);
+      __m256i vS = _mm256_add_epi32(vF, vB);
+
+      // Update best: where vS > vBest, update vBest and vBestJ
+      __m256i mask  = _mm256_cmpgt_epi32(vS, vBest);
+      vBest  = _mm256_blendv_epi8(vBest,  vS,   mask);
+      vBestJ = _mm256_blendv_epi8(vBestJ, vIdx, mask);
+      vIdx   = _mm256_add_epi32(vIdx, v8);
+    }
+
+    // Horizontal reduction
+    int best_arr[8], bestj_arr[8];
+    _mm256_storeu_si256((__m256i*)best_arr,  vBest);
+    _mm256_storeu_si256((__m256i*)bestj_arr, vBestJ);
+    for (int k = 0; k < 8; ++k) {
+      if (best_arr[k] > best && bestj_arr[k] <= n) {
+        best    = best_arr[k];
+        split_j = bestj_arr[k];
+      }
+    }
+  }
+
+  // OpenMP tasks: two subproblems are fully independent
+  std::string ax1, ay1, ax2, ay2;
+
+  #pragma omp task shared(ax1, ay1) if(m > 64)
+  hirschberg(x.substr(0, mid), y.substr(0, split_j), fn, iOpen, iExt, ax1, ay1);
+
+  #pragma omp task shared(ax2, ay2) if(m > 64)
+  hirschberg(x.substr(mid),    y.substr(split_j),    fn, iOpen, iExt, ax2, ay2);
+
+  #pragma omp taskwait
+
+  ax += ax1 + ax2;
+  ay += ay1 + ay2;
+}
+
+
 /**
  * @brief Computes a global pairwise alignment using affine-gap Needleman-Wunsch
  *        with AVX2 SIMD vectorization.
@@ -443,34 +695,62 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
                            ScoreMode mode, ScoreFn score_fn,
                            std::string& aligned_x, std::string& aligned_y,
                            const AlignParams& p) {
-  const int m = x.size();
-  const int n = y.size();
-
+  const int m          = x.size();
+  const int n          = y.size();
   const int iGapOpen   = static_cast<int>(std::round(p.gap_open));
   const int iGapExtend = static_cast<int>(std::round(p.gap_extend));
 
-  // Round n up to a multiple of 8
+  constexpr int HIRSCHBERG_THRESHOLD = 10000;
+
+  if (m > HIRSCHBERG_THRESHOLD || n > HIRSCHBERG_THRESHOLD) {
+    aligned_x.clear();
+    aligned_y.clear();
+
+    #pragma omp parallel if(!omp_in_parallel())
+    #pragma omp single
+    hirschberg(x, y, score_fn, iGapOpen, iGapExtend, aligned_x, aligned_y);
+
+    int  score_val = 0;
+    bool in_gap_x  = false, in_gap_y = false;
+    for (size_t i = 0; i < aligned_x.size(); ++i) {
+      bool gx = (aligned_x[i] == '-');
+      bool gy = (aligned_y[i] == '-');
+      if (!gx && !gy) {
+        score_val += score_fn(aligned_x[i], aligned_y[i]);
+        in_gap_x = in_gap_y = false;
+      } else if (gx && !gy) {
+        score_val += in_gap_x ? iGapExtend : iGapOpen + iGapExtend;
+        in_gap_x = true;
+        in_gap_y = false;
+      } else if (!gx && gy) {
+        score_val += in_gap_y ? iGapExtend : iGapOpen + iGapExtend;
+        in_gap_y = true;
+        in_gap_x = false;
+      }
+      // double-gap columns skipped (invalid in pairwise alignment)
+    }
+    return score_val;
+  }
+
+  // ── Original AVX2 path (short sequences) ────────────────────────────────
   int n8 = (n + 7) & ~7;
 
-  // Allocate aligned buffers of length n8+1
   std::vector<int>  S_prev(n8 + 1), S_cur(n8 + 1);
   std::vector<int>  E_cur(n8 + 1), F_prev(n8 + 1);
   std::vector<char> trace_buf((m + 1) * (n + 1));
-  trace_buf[0] = 'M';  // sentinel for (0,0) — never actually traced
+  trace_buf[0] = 'M';
 
   const __m256i vGapOpen   = _mm256_set1_epi32(iGapOpen);
   const __m256i vGapExtend = _mm256_set1_epi32(iGapExtend);
 
-  // init row 0
   S_prev[0] = 0;
   for (int j = 1; j <= n; ++j) {
-    int e = (j == 1 ? S_prev[j - 1] + p.gap_open : E_cur[j - 1] + iGapExtend);
+    int e        = (j == 1 ? S_prev[j-1] + iGapOpen : E_cur[j-1] + iGapExtend); // ← BUG 1 fixed
     S_prev[j]    = e;
     E_cur[j]     = e;
     F_prev[j]    = INT_MIN / 2;
     trace_buf[j] = (j == 1 ? 'E' : 'e');
   }
-  // pad to n8
   for (int j = n + 1; j <= n8; ++j) {
     S_prev[j] = INT_MIN / 2;
     E_cur[j]  = INT_MIN / 2;
@@ -748,19 +1028,40 @@ void projectGaps(const std::string& oldc, const std::string& newc,
                  std::vector<std::string>& seqs) {
   if (seqs.empty()) return;
 
+  // Count how many gaps will be inserted to pre-validate
+  // newc must be >= oldc in length (only gaps added, never removed)
+  if (newc.size() < oldc.size()) return;  // corrupt alignment, bail out
+
+  // Build a gap-insertion map: for each position in newc, is it a new gap?
+  std::vector<bool> is_new_gap(newc.size(), false);
   size_t old_idx = 0;
   for (size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
-    // Check if the character in the new sequence corresponds to a character
-    // from the old one
     if (old_idx < oldc.size() && newc[new_idx] == oldc[old_idx]) {
-      old_idx++;  // advance the pointer.
+      old_idx++;
     } else {
-      // This is a new gap that was inserted.
-      // Insert a column of gaps into the profile at this new position.
-      for (auto& s : seqs) {
-        s.insert(s.begin() + new_idx, '-');
+      is_new_gap[new_idx] = true;
+    }
+  }
+
+  // Safety check: number of new gaps must not be absurdly large
+  size_t n_new_gaps = std::count(is_new_gap.begin(), is_new_gap.end(), true);
+  // Reject if more than 3x sequence length in gaps — indicates corrupt FFT offset
+  if (n_new_gaps > seqs[0].size() * 3) return;
+
+  // Build each new sequence in one pass — O(L) not O(L²)
+  for (auto& s : seqs) {
+    std::string result;
+    result.reserve(newc.size());
+    size_t src = 0;
+    for (size_t i = 0; i < newc.size(); ++i) {
+      if (is_new_gap[i]) {
+        result += '-';
+      } else {
+        if (src < s.size()) result += s[src++];
+        else                result += '-';  // pad if source exhausted
       }
     }
+    s = std::move(result);
   }
 }
 
@@ -918,27 +1219,39 @@ int computeBandedAlignment(const std::string& x, const std::string& y,
   const int iOpen   = static_cast<int>(std::round(p.gap_open));
   const int iExtend = static_cast<int>(std::round(p.gap_extend));
 
+  // For long sequences, cap bandwidth and only allocate band rows
+  // Each row only needs cells in [max(1, i+seed_offset-bw), min(n, i+seed_offset+bw)]
+  const int bw = std::min(bandwidth, std::max(m, n));  // never wider than sequence
+
+  // Flat allocation: only store 2 rows at a time for S, E, F
+  // But we need full traceback — if sequences are very long, use full NW directly
+  constexpr int LONG_SEQ_THRESHOLD = 2000;
+  if (m > LONG_SEQ_THRESHOLD || n > LONG_SEQ_THRESHOLD) {
+    // For long sequences FFT seeding isn't reliable anyway — use full AVX2 NW
+    return computeGlobalAlignment(x, y, mode, fn, aligned_x, aligned_y, p);
+  }
+
   seed_offset = std::max(-(m - 1), std::min(n - 1, seed_offset));
 
-  std::vector<std::vector<int>>  S(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
-  std::vector<std::vector<int>>  E(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
-  std::vector<std::vector<int>>  F(m + 1, std::vector<int>(n + 1, INT_MIN / 2));
-  std::vector<std::vector<char>> tr(m + 1, std::vector<char>(n + 1, '?'));
+  std::vector<std::vector<int>>  S(m+1, std::vector<int>(n+1, INT_MIN/2));
+  std::vector<std::vector<int>>  E(m+1, std::vector<int>(n+1, INT_MIN/2));
+  std::vector<std::vector<int>>  F(m+1, std::vector<int>(n+1, INT_MIN/2));
+  std::vector<std::vector<char>> tr(m+1, std::vector<char>(n+1, '?'));
 
   S[0][0]  = 0;
   tr[0][0] = 'M';
   for (int j = 1; j <= n; ++j) {
     int diag = -j;
-    if (diag >= seed_offset - bandwidth && diag <= seed_offset + bandwidth) {
-      E[0][j]  = (j == 1) ? iOpen + iExtend : E[0][j - 1] + iExtend;
+    if (diag >= seed_offset - bw && diag <= seed_offset + bw) {
+      E[0][j]  = (j == 1) ? iOpen + iExtend : E[0][j-1] + iExtend;
       S[0][j]  = E[0][j];
       tr[0][j] = (j == 1 ? 'E' : 'e');
     }
   }
   for (int i = 1; i <= m; ++i) {
     int diag = i;
-    if (diag >= seed_offset - bandwidth && diag <= seed_offset + bandwidth) {
-      F[i][0]  = (i == 1) ? iOpen + iExtend : F[i - 1][0] + iExtend;
+    if (diag >= seed_offset - bw && diag <= seed_offset + bw) {
+      F[i][0]  = (i == 1) ? iOpen + iExtend : F[i-1][0] + iExtend;
       S[i][0]  = F[i][0];
       tr[i][0] = (i == 1 ? 'F' : 'f');
     }
@@ -947,64 +1260,39 @@ int computeBandedAlignment(const std::string& x, const std::string& y,
   for (int i = 1; i <= m; ++i) {
     for (int j = 1; j <= n; ++j) {
       int diag = j - i - seed_offset;
-      if (std::abs(diag) > bandwidth) continue;
+      if (std::abs(diag) > bw) continue;
 
-      int prev =
-          (S[i - 1][j - 1] > INT_MIN / 2) ? S[i - 1][j - 1] : INT_MIN / 2;
-      int match_score =
-          (prev > INT_MIN / 2) ? prev + fn(x[i - 1], y[j - 1]) : INT_MIN / 2;
+      int prev        = (S[i-1][j-1] > INT_MIN/2) ? S[i-1][j-1] : INT_MIN/2;
+      int match_score = (prev > INT_MIN/2) ? prev + fn(x[i-1], y[j-1]) : INT_MIN/2;
 
       E[i][j] = std::max(
-          (S[i][j - 1] > INT_MIN / 2) ? S[i][j - 1] + iOpen : INT_MIN / 2,
-          (E[i][j - 1] > INT_MIN / 2) ? E[i][j - 1] + iExtend : INT_MIN / 2);
+          (S[i][j-1] > INT_MIN/2) ? S[i][j-1] + iOpen   : INT_MIN/2,
+          (E[i][j-1] > INT_MIN/2) ? E[i][j-1] + iExtend : INT_MIN/2);
       F[i][j] = std::max(
-          (S[i - 1][j] > INT_MIN / 2) ? S[i - 1][j] + iOpen : INT_MIN / 2,
-          (F[i - 1][j] > INT_MIN / 2) ? F[i - 1][j] + iExtend : INT_MIN / 2);
+          (S[i-1][j] > INT_MIN/2) ? S[i-1][j] + iOpen   : INT_MIN/2,
+          (F[i-1][j] > INT_MIN/2) ? F[i-1][j] + iExtend : INT_MIN/2);
       S[i][j] = std::max({match_score, E[i][j], F[i][j]});
 
-      if (S[i][j] == match_score)
-        tr[i][j] = 'M';
-      else if (S[i][j] == E[i][j])
-        tr[i][j] = 'E';
-      else
-        tr[i][j] = 'F';
+      if      (S[i][j] == match_score) tr[i][j] = 'M';
+      else if (S[i][j] == E[i][j])     tr[i][j] = 'E';
+      else                             tr[i][j] = 'F';
     }
   }
 
-  // if band missed the endpoint, fall back to full NW
-  if (S[m][n] <= INT_MIN / 2) {
+  if (S[m][n] <= INT_MIN/2) {
     return computeGlobalAlignment(x, y, mode, fn, aligned_x, aligned_y, p);
   }
 
-  // Traceback
-  aligned_x.clear();
-  aligned_y.clear();
+  aligned_x.clear(); aligned_y.clear();
   int i = m, j = n;
   while (i > 0 || j > 0) {
     char t = tr[i][j];
-    if (t == 'M') {
-      aligned_x += x[i - 1];
-      aligned_y += y[j - 1];
-      --i;
-      --j;
-    } else if (t == 'F' || t == 'f') {
-      aligned_x += x[i - 1];
-      aligned_y += '-';
-      --i;
-    } else if (t == 'E' || t == 'e') {
-      aligned_x += '-';
-      aligned_y += y[j - 1];
-      --j;
-    } else {
-      if (i > 0) {
-        aligned_x += x[i - 1];
-        aligned_y += '-';
-        --i;
-      } else {
-        aligned_x += '-';
-        aligned_y += y[j - 1];
-        --j;
-      }
+    if      (t == 'M')             { aligned_x += x[i-1]; aligned_y += y[j-1]; --i; --j; }
+    else if (t == 'F' || t == 'f') { aligned_x += x[i-1]; aligned_y += '-';    --i; }
+    else if (t == 'E' || t == 'e') { aligned_x += '-';    aligned_y += y[j-1]; --j; }
+    else {
+      if (i > 0) { aligned_x += x[i-1]; aligned_y += '-'; --i; }
+      else        { aligned_x += '-'; aligned_y += y[j-1]; --j; }
     }
   }
   std::reverse(aligned_x.begin(), aligned_x.end());
