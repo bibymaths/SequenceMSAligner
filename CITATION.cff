@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Mishra"
+    given-names: "Abhinav"
+title: "SequenceMSAligner"
+abstract: "A simple and efficient C++ implementation of multiple sequence alignment algorithm using OpenMPI + AVX2 + affine gap combination"
+repository-code: "https://github.com/bibymaths/SequenceAligner"
+url: "https://bibymaths.github.io/SequenceAligner/"
+license: "BSD-3-Clause"
+keywords:
+  - bioinformatics
+  - sequence-alignment
+  - cpp
+  - openmpi
+  - msa
+  - avx2
+  - affine-gap

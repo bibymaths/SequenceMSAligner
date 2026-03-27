@@ -1,0 +1,73 @@
+site_name: SequenceMSAligner
+site_description: "Documentation for Multiple Sequence Alignment using AVX2 + affine gap combination."
+site_author: "Abhinav Mishra"
+site_url: https://bibymaths.github.io/SequenceMSAligner
+use_directory_urls: false
+repo_url: https://github.com/bibymaths/SequenceMSAligner
+repo_name: bibymaths/SequenceMSAligner
+
+theme:
+  name: material
+  language: en
+  font:
+    text: Ubuntu           # The font for standard paragraph text
+    code: Fira Code        # The font for code blocks
+  palette:
+    # Palette toggle for light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo # Change this to your brand color!
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+
+    # Palette toggle for dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - content.code.copy
+    - toc.integrate
+
+nav:
+  - Design: DESIGN.md
+  - Algorithms: ALGORITHMS.md
+  - Usage: USAGE.md
+  - References: REFERENCES.md
+  - C++ API: API.md
+
+markdown_extensions:
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+      toc_depth: 2
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.superfences
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+extra_css:
+  - stylesheets/extra.css
+
+plugins:
+  - search
+
+watch:
+  - docs
+
+copyright: >
+  Copyright &copy; 2025 <a href="https://bibymaths.github.io">Abhinav Mishra</a>.

@@ -1,4 +1,21 @@
-BasedOnStyle: Google
-IndentWidth: 4
-ColumnLimit: 100
-AllowShortFunctionsOnASingleLine: Empty
+# .clang-format
+BasedOnStyle: Google # Or LLVM, Mozilla, WebKit, etc.
+Language: Cpp
+Standard: c++17 # Or whatever standard you are using
+
+# --- The Magic Doxygen Settings ---
+
+# Automatically wrap long comments to the column limit
+ReflowComments: true
+ColumnLimit: 80 # Or 100, 120, depending on your preference
+
+# Align trailing comments perfectly (e.g., side-by-side member docs)
+AlignTrailingComments: true
+
+# Keep your parameter alignments clean
+AlignConsecutiveDeclarations: true
+AlignConsecutiveAssignments: true
+
+# If you use special Doxygen commands or clang-tidy NOLINT tags,
+# this tells the formatter not to mangle them.
+CommentPragmas: '^ (NOLINT|@cond|@endcond)'

@@ -1,0 +1,50 @@
+name: Deploy Documentation (MkDocs + Doxygen)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 1. Install Dependencies
+      - name: Set up Doxygen
+        run: sudo apt-get install -y doxygen
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install MkDocs and dependencies
+        run: |
+          pip install mkdocs mkdocs-material pymdown-extensions
+
+      # 2. Generate Doxygen HTML
+      - name: Generate Doxygen docs
+        run: doxygen Doxyfile
+
+      # 3. Build MkDocs (Outputs to the 'site/' directory)
+      - name: Build MkDocs
+        run: mkdocs build
+
+      # 4. Merge Doxygen into MkDocs
+      - name: Combine Docs
+        run: |
+          mkdir -p site/api
+          cp -r doxygen/html/* site/api/
+
+      # 5. Deploy the combined site to GitHub Pages
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          force_orphan: true # Keeps your commit history clean on the gh-pages branch
