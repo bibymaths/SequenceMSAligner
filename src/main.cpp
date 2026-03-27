@@ -39,9 +39,10 @@
 #define CYAN "\033[36m"
 
 // Gap penalties
-// Use mutable variables
-double GAP_OPEN = -10.0;
-double GAP_EXTEND = -0.5;
+struct AlignParams {
+    double gap_open   = -10.0;
+    double gap_extend = -0.5;
+};
 static const int LINE_WIDTH = 80;
 
 // Scoring modes
@@ -151,9 +152,13 @@ inline int score(char x, char y, ScoreMode mode) {
  * @return The final alignment score.
  */
 int computeGlobalAlignment(const std::string& x, const std::string& y, ScoreMode mode,
-                           ScoreFn score_fn, std::string& aligned_x, std::string& aligned_y) {
+                           ScoreFn score_fn, std::string& aligned_x, std::string& aligned_y,
+                           const AlignParams& p) {
     const int m = x.size();
     const int n = y.size();
+
+    const int iGapOpen   = static_cast<int>(std::round(p.gap_open));
+    const int iGapExtend = static_cast<int>(std::round(p.gap_extend));
 
     // Round n up to a multiple of 8
     int n8 = (n + 7) & ~7;
@@ -162,14 +167,15 @@ int computeGlobalAlignment(const std::string& x, const std::string& y, ScoreMode
     std::vector<int> S_prev(n8 + 1), S_cur(n8 + 1);
     std::vector<int> E_cur(n8 + 1), F_prev(n8 + 1);
     std::vector<char> trace_buf((m + 1) * (n + 1));
+    trace_buf[0] = 'M';  // sentinel for (0,0) — never actually traced
 
-    const __m256i vGapOpen = _mm256_set1_epi32(int(GAP_OPEN));
-    const __m256i vGapExtend = _mm256_set1_epi32(int(GAP_EXTEND));
+    const __m256i vGapOpen   = _mm256_set1_epi32(iGapOpen);
+    const __m256i vGapExtend = _mm256_set1_epi32(iGapExtend);
 
     // init row 0
     S_prev[0] = 0;
     for (int j = 1; j <= n; ++j) {
-        int e = (j == 1 ? S_prev[j - 1] + GAP_OPEN : E_cur[j - 1] + GAP_EXTEND);
+        int e = (j == 1 ? S_prev[j - 1] + p.gap_open : E_cur[j - 1] + iGapExtend);
         S_prev[j] = e;
         E_cur[j] = e;
         F_prev[j] = INT_MIN / 2;
@@ -190,8 +196,8 @@ int computeGlobalAlignment(const std::string& x, const std::string& y, ScoreMode
 
     for (int i = 1; i <= m; ++i) {
         // scalar first column
-        int openF = Sp[0] + GAP_OPEN;
-        int extF = Fp[0] + GAP_EXTEND;
+        int openF = Sp[0] + iGapOpen;
+        int extF  = Fp[0] + iGapExtend;
         Sc[0] = std::max(openF, extF);
         Ec[0] = INT_MIN / 2;
         Fp[0] = Sc[0];
@@ -396,10 +402,15 @@ std::string generate_consensus(const std::vector<std::string>& profile) {
  * @brief Calculates the Sum-of-Pairs (SP) score for a given MSA with a true affine gap penalty.
  * This version iterates over each pair of sequences to correctly apply open and extend penalties.
  */
-long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode, ScoreFn fn) {
+long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode, ScoreFn fn,
+                             const AlignParams& p) {
     if (msa.empty() || msa[0].empty()) {
         return 0;
     }
+
+    const long long iGapOpen   = static_cast<long long>(std::round(p.gap_open));
+    const long long iGapExtend = static_cast<long long>(std::round(p.gap_extend));
+
     long long total_score = 0;
     int num_seqs = msa.size();
     int align_len = msa[0].size();
@@ -427,11 +438,11 @@ long long calculate_sp_score(const std::vector<std::string>& msa, ScoreMode mode
                     // --- Case 2: Residue vs Gap ---
                     if (in_gap_for_this_pair) {
                         // We are already in a gap, so this is an extension.
-                        total_score += (long long)GAP_EXTEND;
+                        total_score += iGapExtend;
                     } else {
                         // This is the first column of a new gap for this pair.
                         // Apply both the open and the first extend penalty.
-                        total_score += (long long)GAP_OPEN + (long long)GAP_EXTEND;
+                        total_score += iGapOpen + iGapExtend;
                     }
                     in_gap_for_this_pair = true;  // We are now in a gap state.
 
@@ -474,7 +485,8 @@ void projectGaps(const std::string& oldc, const std::string& newc, std::vector<s
  * @brief Compute identity‐based distance matrix in parallel.
  */
 std::vector<std::vector<double>> computeDistanceMatrix(const std::vector<std::string>& seqs,
-                                                       ScoreMode mode, ScoreFn fn) {
+                                                       ScoreMode mode, ScoreFn fn,
+                                                       const AlignParams& p) {
     size_t n = seqs.size();
     std::vector<std::vector<double>> D(n, std::vector<double>(n, 0.0));
 
@@ -482,7 +494,7 @@ std::vector<std::vector<double>> computeDistanceMatrix(const std::vector<std::st
     for (int i = 0; i < (int)n; ++i) {
         for (int j = i + 1; j < (int)n; ++j) {
             std::string ax, ay;
-            computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay);
+            computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay, p);
             int L = ax.size(), match = 0;
             // count matches
             for (int k = 0; k < L; ++k) {
@@ -635,14 +647,15 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D, std::vector<std::
  * @return The best MSA found by this worker.
  */
 std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa, int iterations,
-                                           ScoreMode mode, ScoreFn fn, std::mt19937& g) {
+                                           ScoreMode mode, ScoreFn fn, std::mt19937& g,
+                                           const AlignParams& p) {
     // A profile with 2 or fewer sequences cannot be split and refined.
     if (initial_msa.size() <= 2) {
         return initial_msa;
     }
 
     std::vector<std::string> best_msa = initial_msa;
-    long long best_score = calculate_sp_score(best_msa, mode, fn);
+    long long best_score = calculate_sp_score(best_msa, mode, fn, p);
 
     // Create a vector of indices [0, 1, 2, ...] to shuffle for random splitting.
     std::vector<int> indices(initial_msa.size());
@@ -669,7 +682,7 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
         std::string repB = generate_consensus(profileB);
 
         std::string aligned_repA, aligned_repB;
-        computeGlobalAlignment(repA, repB, mode, fn, aligned_repA, aligned_repB);
+        computeGlobalAlignment(repA, repB, mode, fn, aligned_repA, aligned_repB, p);
 
         // 3. Project the newly introduced gaps back into the full profiles
         projectGaps(repA, aligned_repA, profileA);
@@ -680,7 +693,7 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
         new_msa.insert(new_msa.end(), profileB.begin(), profileB.end());
 
         // 5. If the new alignment has a better score, adopt it as the new best
-        long long new_score = calculate_sp_score(new_msa, mode, fn);
+        long long new_score = calculate_sp_score(new_msa, mode, fn, p);
         if (new_score > best_score) {
             best_score = new_score;
             best_msa = new_msa;
@@ -702,9 +715,10 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
  * @brief Performs iterative refinement in parallel using multiple threads.
  */
 std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int rounds,
-                                    int iterations_per_round, ScoreMode mode, ScoreFn fn) {
+                                    int iterations_per_round, ScoreMode mode, ScoreFn fn,
+                                    const AlignParams& p) {
     std::vector<std::string> global_best_msa = initial_msa;
-    long long global_best_score = calculate_sp_score(global_best_msa, mode, fn);
+    long long global_best_score = calculate_sp_score(global_best_msa, mode, fn, p);
     std::cout << "Initial MSA score: " << global_best_score << std::endl;
 
     for (int r = 0; r < rounds; ++r) {
@@ -722,12 +736,12 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa, int ro
 
             // Each thread starts from the current global best and runs its own refinement search
             thread_results[thread_id] =
-                refine_msa_worker(global_best_msa, iterations_per_round, mode, fn, g);
+                refine_msa_worker(global_best_msa, iterations_per_round, mode, fn, g, p);
         }  // All threads finish and synchronize here
 
         // Now, back in serial, let's check the results from all threads
         for (int i = 0; i < num_threads; ++i) {
-            long long thread_score = calculate_sp_score(thread_results[i], mode, fn);
+            long long thread_score = calculate_sp_score(thread_results[i], mode, fn, p);
             if (thread_score > global_best_score) {
                 // std::cout << "Round " << r + 1 << " update: Thread " << i << " found a better
                 // score: " << thread_score << std::endl;
@@ -942,14 +956,14 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln, const std::vector<std:
  */
 std::vector<std::string> msa_star(const std::vector<std::string>& hdrs,
                                   const std::vector<std::string>& seqs, ScoreMode mode,
-                                  ScoreFn fn) {
+                                  ScoreFn fn, const AlignParams& p) {
     int n = seqs.size();
     std::vector<std::string> aligned(n);
     std::string center = seqs[0];
     aligned[0] = center;
     for (int i = 1; i < n; ++i) {
         std::string ac, as;
-        computeGlobalAlignment(center, seqs[i], mode, fn, ac, as);
+        computeGlobalAlignment(center, seqs[i], mode, fn, ac, as, p);
         // project
         std::vector<std::string> prev(aligned.begin(), aligned.begin() + i);
         projectGaps(center, ac, prev);
@@ -1108,7 +1122,7 @@ std::string formatNewickString(const std::string& nwk) {
  * @param fn The scoring function to use.
  * @return A vector of aligned sequences representing the profile at this node.
  */
-std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn) {
+std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn, const AlignParams& p) {
     // Safety check for null pointers passed from parent nodes
     if (!n) {
         return {};
@@ -1121,8 +1135,8 @@ std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn) {
     }
 
     // Recursively build the profiles for the children.
-    auto A = build_profile(n->left, mode, fn);
-    auto B = build_profile(n->right, mode, fn);
+    auto A = build_profile(n->left, mode, fn, p);
+    auto B = build_profile(n->right, mode, fn, p);
 
     // Case 2: The node is "unary" (has only one child profile).
     // No alignment is needed. The profile is just the child's profile.
@@ -1142,7 +1156,7 @@ std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn) {
 
     // Align the representative strings.
     std::string aligned_consA, aligned_consB;
-    computeGlobalAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB);
+    computeGlobalAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB, p);
 
     // Project the gaps from the alignment into ALL sequences of each profile.
     projectGaps(consA, aligned_consA, A);
@@ -1164,6 +1178,14 @@ struct GapSearchResult {
     double gap_open = 0.0;
     double gap_extend = 0.0;
 };
+
+// ADD THIS — recursive tree deallocator
+void free_tree(Node* n) {
+    if (!n) return;
+    free_tree(n->left);
+    free_tree(n->right);
+    delete n;
+}
 
 /**
  * @brief Searches for the optimal gap penalties in parallel.
@@ -1194,52 +1216,35 @@ GapSearchResult find_optimal_gap_penalties(const std::vector<std::string>& initi
 
 // 2. Perform the grid search in parallel
 #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int i = 0; i < (int)open_penalties.size(); ++i) {
-        for (int j = 0; j < (int)extend_penalties.size(); ++j) {
-            // Use LOCAL variables — never touch the global inside a parallel region
-            double local_open   = open_penalties[i];
-            double local_extend = extend_penalties[j];
+            for (int i = 0; i < (int)open_penalties.size(); ++i) {
+                for (int j = 0; j < (int)extend_penalties.size(); ++j) {
+                    AlignParams p;                         // stack-allocated, thread-private
+                    p.gap_open   = open_penalties[i];
+                    p.gap_extend = extend_penalties[j];
 
-            // Temporarily set thread-local penalty for computeGlobalAlignment
-            // (Since GAP_OPEN/GAP_EXTEND are global, make them threadprivate)
-            double saved_open, saved_extend;
-#pragma omp critical
-            {
-                saved_open   = GAP_OPEN;
-                saved_extend = GAP_EXTEND;
-                GAP_OPEN   = local_open;
-                GAP_EXTEND = local_extend;
-            }
+                    auto D   = computeDistanceMatrix(initial_seqs, mode, fn, p);
+                    auto nwk = buildUPGMATree(D, initial_hdrs);
+                    Node* root = parseNewick(nwk, initial_hdrs);
 
-            auto D    = computeDistanceMatrix(initial_seqs, mode, fn);
-            auto nwk  = buildUPGMATree(D, initial_hdrs);
-            Node* root = parseNewick(nwk, initial_hdrs);
+                    std::queue<Node*> q;
+                    if (root) q.push(root);
+                    while (!q.empty()) {
+                        Node* u = q.front(); q.pop();
+                        if (!u) continue;
+                        if (u->leaf) u->profile = {initial_seqs[u->seq_index]};
+                        else {
+                            if (u->left)  q.push(u->left);
+                            if (u->right) q.push(u->right);
+                        }
+                    }
 
-            std::queue<Node*> q;
-            if (root) q.push(root);
-            while (!q.empty()) {
-                Node* u = q.front(); q.pop();
-                if (!u) continue;
-                if (u->leaf) u->profile = {initial_seqs[u->seq_index]};
-                else {
-                    if (u->left)  q.push(u->left);
-                    if (u->right) q.push(u->right);
+                    auto msa      = build_profile(root, mode, fn, p);
+                    free_tree(root);  // Clean up the tree to prevent memory leaks
+                    long long sc  = calculate_sp_score(msa, mode, fn, p);
+                    int index     = i * (int)extend_penalties.size() + j;
+                    results[index] = {sc, p.gap_open, p.gap_extend};
                 }
             }
-
-            auto msa       = build_profile(root, mode, fn);
-            long long sc   = calculate_sp_score(msa, mode, fn);
-            int index      = i * (int)extend_penalties.size() + j;
-            results[index] = {sc, local_open, local_extend};
-
-#pragma omp critical
-            {
-                GAP_OPEN   = saved_open;
-                GAP_EXTEND = saved_extend;
-            }
-        }
-    }
-
 
     // 4. Find the best result from all the parallel tasks
     GapSearchResult best_result;
@@ -1344,6 +1349,7 @@ int main(int argc, char** argv) {
     // 1) Parse flags
     ScoreMode mode = MODE_DNA;
     ScoreFn fn = edna_score;
+    AlignParams params;
     bool user_gap_open   = false;
     bool user_gap_extend = false;
     int argi = 1;
@@ -1370,14 +1376,14 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: --gap_open requires a value.\n";
                 return 1;
             }
-            GAP_OPEN = std::stod(argv[argi++]);
+            params.gap_open = std::stod(argv[argi++]);
             user_gap_open = true;
         } else if (opt == "--gap_extend") {
             if (argi >= argc) {
-                std::cerr << "Error: --gap_extend requires a value#pra.\n";
+                std::cerr << "Error: --gap_extend requires a value.\n";
                 return 1;
             }
-            GAP_EXTEND = std::stod(argv[argi++]);
+            params.gap_extend = std::stod(argv[argi++]);
             user_gap_extend = true;
         } else {
             // unrecognized flag: step back and break
@@ -1431,37 +1437,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Find Optimal Gap Penalties before proceeding
     if (!user_gap_open || !user_gap_extend) {
-        auto best_params = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
-        // Only overwrite the ones the user did NOT provide
-        if (!user_gap_open)   GAP_OPEN   = best_params.gap_open;
-        if (!user_gap_extend) GAP_EXTEND = best_params.gap_extend;
-        std::cout << "\nOptimal parameters found: GAP_OPEN=" << GAP_OPEN
-                  << ", GAP_EXTEND=" << GAP_EXTEND << " with score: " << best_params.score
+        auto best = find_optimal_gap_penalties(seqs, hdrs, mode, fn);
+        if (!user_gap_open)   params.gap_open   = best.gap_open;
+        if (!user_gap_extend) params.gap_extend  = best.gap_extend;
+        std::cout << "\nOptimal parameters found: GAP_OPEN=" << params.gap_open
+                  << ", GAP_EXTEND=" << params.gap_extend << " with score: " << best.score
                   << "\n" << std::endl;
     } else {
-        std::cout << "\nUsing user-supplied penalties: GAP_OPEN=" << GAP_OPEN
-                  << ", GAP_EXTEND=" << GAP_EXTEND << "\n" << std::endl;
+        std::cout << "\nUsing user-supplied: GAP_OPEN=" << params.gap_open
+                  << ", GAP_EXTEND=" << params.gap_extend << "\n" << std::endl;
     }
 
-    // 5) Simplify headers
-    for (int i = 0; i < n; ++i) {
-        if (mode == MODE_PROTEIN) {
-            auto& h = hdrs[i];
-            size_t p1 = h.find('|');
-            size_t p2 = (p1 == std::string::npos ? std::string::npos : h.find('|', p1 + 1));
-            if (p1 != std::string::npos && p2 != std::string::npos)
-                hdrs[i] = h.substr(p1 + 1, p2 - p1 - 1);
-        } else {
-            auto& h = hdrs[i];
-            size_t sp = h.find_first_of(" \t");
-            if (sp != std::string::npos) hdrs[i] = h.substr(0, sp);
-        }
-    }
+    auto D = computeDistanceMatrix(seqs, mode, fn, params);
 
-    // 6) Compute guide tree
-    auto D = computeDistanceMatrix(seqs, mode, fn);
     // Save the identity matrix to a file
     saveIdentityMatrix(D, hdrs, outdir);
     auto nwk = buildUPGMATree(D, hdrs);
@@ -1490,7 +1479,7 @@ int main(int argc, char** argv) {
             if (u->seq_index < 0 || u->seq_index >= seqs.size()) {
                 std::cerr << "\nFATAL LOGIC ERROR: Invalid sequence index " << u->seq_index
                           << " detected for a leaf node. Cannot retrieve sequence." << std::endl;
-                exit(1);  // Exit with an error
+                return 1;
             }
             u->profile = {seqs[u->seq_index]};
         } else {
@@ -1501,12 +1490,13 @@ int main(int argc, char** argv) {
     }
 
     // recursively build the full MSA
-    auto msa = build_profile(root, mode, fn);
+    auto msa = build_profile(root, mode, fn, params);
+    free_tree(root);  // Clean up the tree to prevent memory leaks
 
     // Refine the MSA using multiple threads over several rounds
     int total_rounds = 3;
     int iterations_per_thread_per_round = 10;  // Total work = rounds * iterations * num_threads
-    msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn);
+    msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn, params);
 
     // 10) Print and save colored MSA
     printColorMSA(msa);
