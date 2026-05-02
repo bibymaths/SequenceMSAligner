@@ -439,18 +439,19 @@ std::string canonicalize_fasta_header(std::string header, ScoreMode mode) {
   if (mode == MODE_PROTEIN) {
     // UniProt style: sp|P12345|NAME
     size_t p1 = header.find('|');
-    size_t p2 = (p1 == std::string::npos ? std::string::npos : header.find('|', p1 + 1));
+    size_t p2 = (p1 == std::string::npos ? std::string::npos
+                                         : header.find('|', p1 + 1));
     if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1 + 1) {
       token = header.substr(p1 + 1, p2 - p1 - 1);
     } else {
       // Otherwise take the first token before whitespace
       size_t ws = header.find_first_of(" \t\r\n");
-      token = (ws != std::string::npos) ? header.substr(0, ws) : header;
+      token     = (ws != std::string::npos) ? header.substr(0, ws) : header;
     }
   } else {
     // DNA mode: first token before whitespace
     size_t ws = header.find_first_of(" \t\r\n");
-    token = (ws != std::string::npos) ? header.substr(0, ws) : header;
+    token     = (ws != std::string::npos) ? header.substr(0, ws) : header;
   }
   // Build canonical name by replacing unsafe characters
   std::string canonical;
@@ -460,10 +461,12 @@ std::string canonicalize_fasta_header(std::string header, ScoreMode mode) {
     if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
       canonical.push_back(c);
     } else if (c == '.') {
-      // Replace dot with underscore to disambiguate accession dot from branch length
+      // Replace dot with underscore to disambiguate accession dot from branch
+      // length
       canonical.push_back('_');
     } else {
-      // Replace all other characters (including punctuation and whitespace) with underscore
+      // Replace all other characters (including punctuation and whitespace)
+      // with underscore
       canonical.push_back('_');
     }
   }
@@ -519,11 +522,11 @@ void validate_headers_unique(const std::vector<std::string>& hdrs) {
  * @param expected_rows Expected number of rows corresponding to input sequences
  */
 void validate_msa_shape(const std::vector<std::string>& msa,
-                        std::size_t                    expected_rows) {
+                        std::size_t                     expected_rows) {
   if (msa.size() != expected_rows) {
     std::ostringstream oss;
-    oss << "MSA row count (" << msa.size()
-        << ") != expected header count (" << expected_rows << ")";
+    oss << "MSA row count (" << msa.size() << ") != expected header count ("
+        << expected_rows << ")";
     throw std::runtime_error(oss.str());
   }
 }
@@ -604,7 +607,8 @@ void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
       // Skip any leading sequence lines before the first header
       continue;
     }
-    // Append only alphabetic characters (converted to uppercase) to the sequence
+    // Append only alphabetic characters (converted to uppercase) to the
+    // sequence
     for (char c : line) {
       if (std::isalpha(static_cast<unsigned char>(c))) {
         seq.push_back(std::toupper(static_cast<unsigned char>(c)));
@@ -1365,8 +1369,8 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
 }
 
 /**
- * @brief Normalizes the lengths of all sequences in a multiple sequence alignment
- *        by padding shorter sequences with trailing gap characters.
+ * @brief Normalizes the lengths of all sequences in a multiple sequence
+ * alignment by padding shorter sequences with trailing gap characters.
  *
  * This function ensures that all sequences in the input vector @p msa have the
  * same length by appending @c '-' characters to any sequence that is shorter
@@ -1376,7 +1380,8 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
  *
  * @param[in,out] msa Vector of aligned sequences to normalize. All sequences
  *                     are modified in place to have the same length after
- *                     this function returns. If @p msa is empty, no action is taken.
+ *                     this function returns. If @p msa is empty, no action is
+ * taken.
  */
 void normalize_msa_lengths(std::vector<std::string>& msa) {
   if (msa.empty()) return;
@@ -1459,17 +1464,17 @@ void projectGaps(const std::string& oldc, const std::string& newc,
 static std::string ungap(const std::string& s) {
   std::string out;
   out.reserve(s.size());
-  for (char c : s) if (c != '-') out.push_back(c);
+  for (char c : s)
+    if (c != '-') out.push_back(c);
   return out;
 }
 
 std::vector<std::string> restore_full_length_msa(
     const std::vector<std::string>& originals,
     const std::vector<std::string>& aligned) {
-
   // This will store the final MSA sorted in the original input order
   std::vector<std::string> out(originals.size());
-  std::vector<bool> used_aligned(aligned.size(), false);
+  std::vector<bool>        used_aligned(aligned.size(), false);
 
   for (size_t i = 0; i < originals.size(); ++i) {
     bool found = false;
@@ -1486,16 +1491,18 @@ std::vector<std::string> restore_full_length_msa(
         // Re-attach unaligned prefixes and suffixes
         std::string prefix = originals[i].substr(0, pos);
         std::string suffix = originals[i].substr(pos + core.size());
-        out[i] = prefix + aligned[j] + suffix;
+        out[i]             = prefix + aligned[j] + suffix;
 
         used_aligned[j] = true;
-        found = true;
+        found           = true;
         break;
       }
     }
 
     if (!found) {
-      throw std::runtime_error("Aligned core not found in original sequence for row " + std::to_string(i));
+      throw std::runtime_error(
+          "Aligned core not found in original sequence for row " +
+          std::to_string(i));
     }
   }
 
@@ -1537,8 +1544,8 @@ std::vector<std::vector<double>> computeDistanceMatrix(
     for (int j = i + 1; j < static_cast<int>(n); ++j) {
       std::string ax, ay;
       computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay, p);
-      const int L = checked_size_to_int(ax.size(), "ax.size()");
-      int       matches = 0;
+      const int L        = checked_size_to_int(ax.size(), "ax.size()");
+      int       matches  = 0;
       int       compared = 0;
       for (int k = 0; k < L; ++k) {
         char ca = ax[k];
@@ -1811,7 +1818,9 @@ int computeBandedAlignment(const std::string& x, const std::string& y,
  * @see fftCrossCorrelation(), computeBandedAlignment(), projectGaps(),
  *      build_profile(), build_profile_le()
  */
-std::vector<std::string> build_profile_fft(Node* n, const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
+std::vector<std::string> build_profile_fft(Node*                           n,
+                                           const std::vector<std::string>& seqs,
+                                           ScoreMode mode, ScoreFn fn,
                                            const AlignParams& p) {
   if (!n) return {};
   if (n->leaf) {
@@ -1821,7 +1830,7 @@ std::vector<std::string> build_profile_fft(Node* n, const std::vector<std::strin
       oss << "Invalid leaf sequence index " << idx;
       throw std::runtime_error(oss.str());
     }
-    return { seqs[idx] };
+    return {seqs[idx]};
   }
 
   auto A = build_profile_fft(n->left, seqs, mode, fn, p);
@@ -1833,8 +1842,9 @@ std::vector<std::string> build_profile_fft(Node* n, const std::vector<std::strin
   auto [offset, corr] = fftCrossCorrelation(consA, consB, mode);
 
   std::string aligned_consA, aligned_consB;
-  int bw = std::max(50, checked_size_to_int(std::max(consA.size(), consB.size()) / 4,
-                                            "consensus bandwidth"));
+  int         bw =
+      std::max(50, checked_size_to_int(std::max(consA.size(), consB.size()) / 4,
+                                       "consensus bandwidth"));
   computeBandedAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB,
                          p, offset, bw);
 
@@ -1946,7 +1956,8 @@ LENode build_profile_le(Node* n, const std::vector<std::string>& raw_seqs,
   if (!n) return {};
   if (n->leaf) {
     int idx = n->seq_index;
-    if (idx < 0 || idx >= checked_size_to_int(raw_seqs.size(), "raw_seqs.size()")) {
+    if (idx < 0 ||
+        idx >= checked_size_to_int(raw_seqs.size(), "raw_seqs.size()")) {
       std::ostringstream oss;
       oss << "Invalid leaf sequence index " << idx;
       throw std::runtime_error(oss.str());
@@ -2045,8 +2056,8 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
  * @return A string conforming to the required job ID specification.
  */
 static std::string generate_job_id() {
-  auto now      = std::chrono::system_clock::now();
-  auto now_time = std::chrono::system_clock::to_time_t(now);
+  auto    now      = std::chrono::system_clock::now();
+  auto    now_time = std::chrono::system_clock::to_time_t(now);
   std::tm tm{};
 #ifdef _WIN32
   gmtime_s(&tm, &now_time);
@@ -2056,12 +2067,12 @@ static std::string generate_job_id() {
   std::ostringstream oss;
   oss << "msalign-I";
   oss << std::put_time(&tm, "%Y%m%d-%H%M%S");
-  std::random_device rd;
-  std::mt19937       gen(rd());
+  std::random_device                 rd;
+  std::mt19937                       gen(rd());
   std::uniform_int_distribution<int> dist4(0, 9999);
   std::uniform_int_distribution<int> dist8(0, 99999999);
-  int r4 = dist4(gen);
-  int r8 = dist8(gen);
+  int                                r4 = dist4(gen);
+  int                                r8 = dist8(gen);
   oss << "-" << std::setw(4) << std::setfill('0') << r4;
   oss << "-" << std::setw(8) << std::setfill('0') << r8;
   oss << "-p1m";
@@ -2079,9 +2090,9 @@ static std::string generate_job_id() {
  * @param msa Aligned sequences of equal length.
  * @return A symmetric matrix of size N×N with values in [0,1].
  */
-static std::vector<std::vector<double>>
-compute_percent_identity_from_msa(const std::vector<std::string>& msa) {
-  const std::size_t n = msa.size();
+static std::vector<std::vector<double>> compute_percent_identity_from_msa(
+    const std::vector<std::string>& msa) {
+  const std::size_t                n = msa.size();
   std::vector<std::vector<double>> pim(n, std::vector<double>(n, 1.0));
   if (n == 0) return pim;
   const std::size_t L = msa[0].size();
@@ -2097,7 +2108,8 @@ compute_percent_identity_from_msa(const std::vector<std::string>& msa) {
         ++compared_pos;
       }
       double identity = 0.0;
-      if (compared_pos > 0) identity = static_cast<double>(matches) / compared_pos;
+      if (compared_pos > 0)
+        identity = static_cast<double>(matches) / compared_pos;
       pim[i][j] = pim[j][i] = identity;
     }
   }
@@ -2116,17 +2128,18 @@ compute_percent_identity_from_msa(const std::vector<std::string>& msa) {
  * @param names Sequence identifiers corresponding to the rows/columns.
  * @param outpath Path to write the identity matrix file.
  */
-static void write_percent_identity_matrix(const std::vector<std::vector<double>>& pim,
-                                          const std::vector<std::string>& names,
-                                          const std::string& outpath) {
+static void write_percent_identity_matrix(
+    const std::vector<std::vector<double>>& pim,
+    const std::vector<std::string>& names, const std::string& outpath) {
   std::ofstream out(outpath);
   if (!out) {
-    std::cerr << "Error writing percent identity matrix to " << outpath << std::endl;
+    std::cerr << "Error writing percent identity matrix to " << outpath
+              << std::endl;
     return;
   }
   out << "#\n#\n#  Percent Identity Matrix\n#\n#\n\n";
-  const std::size_t n = names.size();
-  std::size_t max_len = 0;
+  const std::size_t n       = names.size();
+  std::size_t       max_len = 0;
   for (const auto& nm : names) {
     if (nm.size() > max_len) max_len = nm.size();
   }
@@ -2144,7 +2157,8 @@ static void write_percent_identity_matrix(const std::vector<std::vector<double>>
 }
 
 /**
- * @brief Write a multiple sequence alignment in CLUSTAL format with residue numbering.
+ * @brief Write a multiple sequence alignment in CLUSTAL format with residue
+ * numbering.
  *
  * Sequence names are left-aligned to a uniform width. The alignment is printed
  * in blocks of a fixed column width. At the end of each sequence line, the
@@ -2159,7 +2173,7 @@ static void write_percent_identity_matrix(const std::vector<std::vector<double>>
  */
 static void write_clustal_alignment(const std::vector<std::string>& msa,
                                     const std::vector<std::string>& names,
-                                    const std::string& outpath,
+                                    const std::string&              outpath,
                                     std::size_t block_size = 60) {
   std::ofstream out(outpath);
   if (!out) {
@@ -2172,8 +2186,8 @@ static void write_clustal_alignment(const std::vector<std::string>& msa,
     out.close();
     return;
   }
-  const std::size_t L = msa[0].size();
-  std::size_t name_width = 0;
+  const std::size_t L          = msa[0].size();
+  std::size_t       name_width = 0;
   for (const auto& nm : names) {
     if (nm.size() > name_width) name_width = nm.size();
   }
@@ -2195,7 +2209,7 @@ static void write_clustal_alignment(const std::vector<std::string>& msa,
     }
     out << std::setw(static_cast<int>(name_width)) << std::left << "";
     for (std::size_t col = start; col < end; ++col) {
-      char c = msa[0][col];
+      char c         = msa[0][col];
       bool conserved = (c != '-');
       for (std::size_t i = 1; i < n && conserved; ++i) {
         if (msa[i][col] != c) conserved = false;
@@ -2216,7 +2230,7 @@ static void write_clustal_alignment(const std::vector<std::string>& msa,
  */
 static void write_fasta_alignment(const std::vector<std::string>& msa,
                                   const std::vector<std::string>& names,
-                                  const std::string& outpath) {
+                                  const std::string&              outpath) {
   std::ofstream out(outpath);
   if (!out) {
     std::cerr << "Error writing FASTA alignment to " << outpath << std::endl;
@@ -2236,19 +2250,17 @@ static void write_fasta_alignment(const std::vector<std::string>& msa,
 /**
  * @brief Write metadata about the run to a JSON file.
  */
-static void write_metadata_json(const std::string& outpath, const std::string& job_id,
-                                const std::string& tool_name, const std::string& tool_version,
-                                const std::string& start_time, const std::string& end_time,
-                                double duration_seconds, const std::string& cmdline,
-                                const std::string& input_file, const std::string& sequence_type,
-                                const std::vector<std::string>& names, int num_threads,
-                                bool avx2_enabled, bool openmp_enabled,
-                                const std::string& distance_model,
-                                const std::string& guide_tree_alg,
-                                const std::string& progressive_alg,
-                                const std::string& refinement_method,
-                                const std::string& best_method,
-                                const std::map<std::string,std::string>& outputs) {
+static void write_metadata_json(
+    const std::string& outpath, const std::string& job_id,
+    const std::string& tool_name, const std::string& tool_version,
+    const std::string& start_time, const std::string& end_time,
+    double duration_seconds, const std::string& cmdline,
+    const std::string& input_file, const std::string& sequence_type,
+    const std::vector<std::string>& names, int num_threads, bool avx2_enabled,
+    bool openmp_enabled, const std::string& distance_model,
+    const std::string& guide_tree_alg, const std::string& progressive_alg,
+    const std::string& refinement_method, const std::string& best_method,
+    const std::map<std::string, std::string>& outputs) {
   std::ofstream out(outpath);
   if (!out) {
     std::cerr << "Error writing metadata JSON to " << outpath << std::endl;
@@ -2275,9 +2287,11 @@ static void write_metadata_json(const std::string& outpath, const std::string& j
   out << "  \"num_threads\": " << num_threads << ",\n";
   out << "  \"simd\": {\n";
   out << "    \"avx2_enabled\": " << (avx2_enabled ? "true" : "false") << ",\n";
-  out << "    \"runtime_detected\": " << (avx2_enabled ? "true" : "false") << "\n";
+  out << "    \"runtime_detected\": " << (avx2_enabled ? "true" : "false")
+      << "\n";
   out << "  },\n";
-  out << "  \"openmp_enabled\": " << (openmp_enabled ? "true" : "false") << ",\n";
+  out << "  \"openmp_enabled\": " << (openmp_enabled ? "true" : "false")
+      << ",\n";
   out << "  \"algorithm\": {\n";
   out << "    \"distance_model\": \"" << distance_model << "\",\n";
   out << "    \"guide_tree\": \"" << guide_tree_alg << "\",\n";
@@ -2289,8 +2303,10 @@ static void write_metadata_json(const std::string& outpath, const std::string& j
   std::size_t counter = 0;
   for (const auto& kv : outputs) {
     out << "    \"" << kv.first << "\": \"" << kv.second << "\"";
-    if (++counter < outputs.size()) out << ",\n";
-    else out << "\n";
+    if (++counter < outputs.size())
+      out << ",\n";
+    else
+      out << "\n";
   }
   out << "  },\n";
   out << "  \"status\": \"success\",\n";
@@ -2303,22 +2319,34 @@ static void write_metadata_json(const std::string& outpath, const std::string& j
 /**
  * @brief Write a submission XML file describing the run.
  */
-static void write_submission_xml(const std::string& outpath, const std::string& job_id,
-                                 const std::string& cmdline,
-                                 const std::vector<std::string>& names,
-                                 const std::map<std::string,std::string>& outputs,
-                                 const std::string& sequence_type) {
+static void write_submission_xml(
+    const std::string& outpath, const std::string& job_id,
+    const std::string& cmdline, const std::vector<std::string>& names,
+    const std::map<std::string, std::string>& outputs,
+    const std::string&                        sequence_type) {
   auto xml_escape = [](const std::string& s) -> std::string {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
       switch (c) {
-        case '&': out += "&amp;"; break;
-        case '<': out += "&lt;"; break;
-        case '>': out += "&gt;"; break;
-        case '"': out += "&quot;"; break;
-        case '\'': out += "&apos;"; break;
-        default: out.push_back(c); break;
+        case '&':
+          out += "&amp;";
+          break;
+        case '<':
+          out += "&lt;";
+          break;
+        case '>':
+          out += "&gt;";
+          break;
+        case '"':
+          out += "&quot;";
+          break;
+        case '\'':
+          out += "&apos;";
+          break;
+        default:
+          out.push_back(c);
+          break;
       }
     }
     return out;
@@ -2331,21 +2359,34 @@ static void write_submission_xml(const std::string& outpath, const std::string& 
   out << "<execution>\n";
   out << "  <commandLine>" << xml_escape(cmdline) << "</commandLine>\n";
   out << "  <userParameters class=\"linked-hash-map\">\n";
-  out << "    <entry><string>program</string><string>msalign-compatible-tool</string></entry>\n";
+  out << "    "
+         "<entry><string>program</string><string>msalign-compatible-tool</"
+         "string></entry>\n";
   out << "    <entry><string>version</string><string>1.0</string></entry>\n";
-  out << "    <entry><string>guidetreeout</string><boolean>true</boolean></entry>\n";
-  out << "    <entry><string>dismatout</string><boolean>true</boolean></entry>\n";
-  out << "    <entry><string>dealign</string><boolean>false</boolean></entry>\n";
+  out << "    "
+         "<entry><string>guidetreeout</string><boolean>true</boolean></"
+         "entry>\n";
+  out << "    "
+         "<entry><string>dismatout</string><boolean>true</boolean></entry>\n";
+  out << "    "
+         "<entry><string>dealign</string><boolean>false</boolean></entry>\n";
   out << "    <entry><string>mbed</string><boolean>true</boolean></entry>\n";
-  out << "    <entry><string>mbediteration</string><boolean>true</boolean></entry>\n";
+  out << "    "
+         "<entry><string>mbediteration</string><boolean>true</boolean></"
+         "entry>\n";
   out << "    <entry><string>iterations</string><int>3</int></entry>\n";
-  out << "    <entry><string>outfmt</string><string>clustal_num</string></entry>\n";
+  out << "    "
+         "<entry><string>outfmt</string><string>clustal_num</string></entry>\n";
   out << "    <entry><string>order</string><string>aligned</string></entry>\n";
-  out << "    <entry><string>stype</string><string>" << xml_escape(sequence_type) << "</string></entry>\n";
-  out << "    <entry><string>sequence</string><string>" << xml_escape(outputs.at("sequence")) << "</string></entry>\n";
+  out << "    <entry><string>stype</string><string>"
+      << xml_escape(sequence_type) << "</string></entry>\n";
+  out << "    <entry><string>sequence</string><string>"
+      << xml_escape(outputs.at("sequence")) << "</string></entry>\n";
   out << "  </userParameters>\n";
-  out << "  <outputLocation>file:" << xml_escape(outputs.at("zip")) << "</outputLocation>\n";
-  out << "  <errorLocation>file:" << xml_escape(outputs.at("zip")) << "</errorLocation>\n";
+  out << "  <outputLocation>file:" << xml_escape(outputs.at("zip"))
+      << "</outputLocation>\n";
+  out << "  <errorLocation>file:" << xml_escape(outputs.at("zip"))
+      << "</errorLocation>\n";
   out << "  <toolId>msalign-compatible-tool</toolId>\n";
   out << "  <jobId>" << xml_escape(job_id) << "</jobId>\n";
   out << "  <jobTitle></jobTitle>\n";
@@ -2417,7 +2458,7 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
     int size_a = C[a].size;
     int size_b = C[b].size;
     C[a].size  = size_a + size_b;
-    alive[b] = false;
+    alive[b]   = false;
     --remaining;
 
     // update distances from a to all k
@@ -2476,7 +2517,7 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
     if (split_point == 0 || split_point >= indices.size()) continue;
 
     std::vector<std::string> profileA, profileB;
-    std::vector<int>         idxA,    idxB;
+    std::vector<int>         idxA, idxB;
     profileA.reserve(split_point);
     profileB.reserve(indices.size() - split_point);
     idxA.reserve(split_point);
@@ -2505,15 +2546,17 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
     if (ungapped_repA.empty() || ungapped_repB.empty()) continue;
 
     std::string aligned_repA, aligned_repB;
-    computeGlobalAlignment(ungapped_repA, ungapped_repB, mode, fn,
-                           aligned_repA, aligned_repB, p);
+    computeGlobalAlignment(ungapped_repA, ungapped_repB, mode, fn, aligned_repA,
+                           aligned_repB, p);
 
     projectGaps(ungapped_repA, aligned_repA, profileA);
     projectGaps(ungapped_repB, aligned_repB, profileB);
 
     std::vector<std::string> new_msa(best_msa.size());
-    for (std::size_t k = 0; k < idxA.size(); ++k) new_msa[idxA[k]] = profileA[k];
-    for (std::size_t k = 0; k < idxB.size(); ++k) new_msa[idxB[k]] = profileB[k];
+    for (std::size_t k = 0; k < idxA.size(); ++k)
+      new_msa[idxA[k]] = profileA[k];
+    for (std::size_t k = 0; k < idxB.size(); ++k)
+      new_msa[idxB[k]] = profileB[k];
 
     normalize_msa_lengths(new_msa);
 
@@ -2701,11 +2744,11 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
 
   // 2. Position calculation and alignment block writing
   const size_t num_sequences    = aln.size();
-  size_t alignment_length = 0;
+  size_t       alignment_length = 0;
   for (const auto& row : aln) {
     alignment_length = std::max(alignment_length, row.size());
   }
-  const int    LINE_WIDTH       = 80;
+  const int LINE_WIDTH = 80;
 
   // Track "current ungapped" position for each sequence, starting from 1
   std::vector<int> pos(num_sequences, 1);
@@ -2740,15 +2783,15 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
       // Layout: [Header] [Start Pos] [Sequence] [End Pos]
       {
         std::string safeHdr = htmlEscape(hdrs[i]);
-        html_file << "<span class=\"header\" title=\"" << safeHdr
-                  << "\">" << safeHdr << "</span>"
-                  << "<span class=\"position\">" << block_start[i]
-                  << "</span>" << "<span class=\"sequence-block\">";
+        html_file << "<span class=\"header\" title=\"" << safeHdr << "\">"
+                  << safeHdr << "</span>"
+                  << "<span class=\"position\">" << block_start[i] << "</span>"
+                  << "<span class=\"sequence-block\">";
       }
 
       // Write the colored characters for the current block
       for (size_t j = start_col; j < end_col; ++j) {
-        char current_char = (j < aln[i].size()) ? aln[i][j] : '-';
+        char current_char       = (j < aln[i].size()) ? aln[i][j] : '-';
         bool is_fully_conserved = (current_char != '-');
         if (is_fully_conserved) {
           for (size_t x = 0; x < num_sequences; ++x) {
@@ -2871,12 +2914,13 @@ Node* parseNewick(const std::string&              nwk,
     } else {
       // Parent already has two children – invalid binary tree
       delete leaf;
-      throw std::runtime_error("Invalid guide tree: node has more than two children");
+      throw std::runtime_error(
+          "Invalid guide tree: node has more than two children");
     }
   };
   std::stack<Node*> st;
-  Node* root = nullptr;
-  std::string token;
+  Node*             root = nullptr;
+  std::string       token;
   for (std::size_t i = 0; i < nwk.size(); ++i) {
     char c = nwk[i];
     if (std::isspace(static_cast<unsigned char>(c))) {
@@ -2893,7 +2937,8 @@ Node* parseNewick(const std::string&              nwk,
           parent->right = node;
         } else {
           delete node;
-          throw std::runtime_error("Invalid guide tree: node has more than two children");
+          throw std::runtime_error(
+              "Invalid guide tree: node has more than two children");
         }
       } else if (!root) {
         root = node;
@@ -2923,7 +2968,8 @@ Node* parseNewick(const std::string&              nwk,
       std::size_t j = i + 1;
       while (j < nwk.size()) {
         char d = nwk[j];
-        if (std::isdigit(static_cast<unsigned char>(d)) || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-') {
+        if (std::isdigit(static_cast<unsigned char>(d)) || d == '.' ||
+            d == 'e' || d == 'E' || d == '+' || d == '-') {
           ++j;
         } else {
           break;
@@ -3014,7 +3060,9 @@ std::string formatNewickString(const std::string& nwk) {
  * @param fn The scoring function to use.
  * @return A vector of aligned sequences representing the profile at this node.
  */
-std::vector<std::string> build_profile(Node* n, const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
+std::vector<std::string> build_profile(Node*                           n,
+                                       const std::vector<std::string>& seqs,
+                                       ScoreMode mode, ScoreFn fn,
                                        const AlignParams& p) {
   // Safety check for null pointers passed from parent nodes
   if (!n) {
@@ -3031,7 +3079,7 @@ std::vector<std::string> build_profile(Node* n, const std::vector<std::string>& 
       oss << "Invalid leaf sequence index " << idx;
       throw std::runtime_error(oss.str());
     }
-    return { seqs[idx] };
+    return {seqs[idx]};
   }
 
   // Recursively build the profiles for the children.
@@ -3119,10 +3167,7 @@ struct GapSearchResult {
  */
 GapSearchResult find_optimal_gap_penalties(
     const std::vector<std::string>& initial_seqs,
-    const std::vector<std::string>& initial_hdrs,
-    ScoreMode mode,
-    ScoreFn fn) {
-
+    const std::vector<std::string>& initial_hdrs, ScoreMode mode, ScoreFn fn) {
   // std::cout << "\n--- Starting search for optimal gap penalties ---"
   //           << std::endl;
 
@@ -3133,7 +3178,8 @@ GapSearchResult find_optimal_gap_penalties(
    * Protein and DNA/RNA use the same affine-gap principle:
    * gap opening must be substantially more expensive than gap extension.
    *
-   * Because penalties are negative, "larger penalty" means larger absolute value.
+   * Because penalties are negative, "larger penalty" means larger absolute
+   * value.
    *
    * Example:
    *   gap_open   = -14.0
@@ -3148,25 +3194,27 @@ GapSearchResult find_optimal_gap_penalties(
      * Protein alignments usually tolerate a broader gap-open search space.
      * BLOSUM62-based scoring often benefits from stronger opening penalties.
      */
-    for (double o = -30.0; o <= -6.0; o += 2.0) {
-      open_penalties.push_back(o);
+    // o = -30.0 + i * 2.0, while o <= -6.0 → 13 iterations (i=0..12)
+    for (int i = 0; (-30.0 + i * 2.0) <= -6.0; ++i) {
+      open_penalties.push_back(-30.0 + i * 2.0);
     }
 
-    for (double e = -5.0; e <= -0.25; e += 0.25) {
-      extend_penalties.push_back(e);
+    for (int i = 0; (-5.0 + i * 0.25) <= -0.25; ++i) {
+      extend_penalties.push_back(-5.0 + i * 0.25);
     }
 
   } else {
     /*
-     * DNA/RNA alignments generally need a slightly narrower gap-extension range.
-     * Very high extension penalties can fragment nucleotide alignments badly.
+     * DNA/RNA alignments generally need a slightly narrower gap-extension
+     * range. Very high extension penalties can fragment nucleotide alignments
+     * badly.
      */
-    for (double o = -25.0; o <= -5.0; o += 2.0) {
-      open_penalties.push_back(o);
+    for (int i = 0; (-25.0 + i * 2.0) <= -5.0; ++i) {
+      open_penalties.push_back(-25.0 + i * 2.0);
     }
 
-    for (double e = -4.0; e <= -0.25; e += 0.25) {
-      extend_penalties.push_back(e);
+    for (int i = 0; (-4.0 + i * 0.25) <= -0.25; ++i) {
+      extend_penalties.push_back(-4.0 + i * 0.25);
     }
   }
 
@@ -3175,25 +3223,20 @@ GapSearchResult find_optimal_gap_penalties(
 
 #pragma omp parallel for collapse(2) schedule(dynamic) default(none) \
     shared(open_penalties, extend_penalties, results, initial_seqs,  \
-           initial_hdrs, mode, fn)
+               initial_hdrs, mode, fn)
   for (int i = 0;
-       i < checked_size_to_int(open_penalties.size(),
-                               "open_penalties.size()");
+       i < checked_size_to_int(open_penalties.size(), "open_penalties.size()");
        ++i) {
-
-    for (int j = 0;
-         j < checked_size_to_int(extend_penalties.size(),
-                                 "extend_penalties.size()");
+    for (int j = 0; j < checked_size_to_int(extend_penalties.size(),
+                                            "extend_penalties.size()");
          ++j) {
-
       AlignParams p;
       p.gap_open   = open_penalties[i];
       p.gap_extend = extend_penalties[j];
 
-      const int index =
-          i * checked_size_to_int(extend_penalties.size(),
-                                  "extend_penalties.size()") +
-          j;
+      const int index = i * checked_size_to_int(extend_penalties.size(),
+                                                "extend_penalties.size()") +
+                        j;
 
       /*
        * Biological affine-gap sanity constraint.
@@ -3252,12 +3295,11 @@ GapSearchResult find_optimal_gap_penalties(
         if (u->leaf) {
           int idx = u->seq_index;
 
-          if (idx < 0 ||
-              idx >= checked_size_to_int(initial_seqs.size(),
-                                         "initial_seqs.size()")) {
+          if (idx < 0 || idx >= checked_size_to_int(initial_seqs.size(),
+                                                    "initial_seqs.size()")) {
             free_tree(root);
             results[index] = {LLONG_MIN, p.gap_open, p.gap_extend};
-            root = nullptr;
+            root           = nullptr;
             break;
           }
 
@@ -3509,7 +3551,8 @@ int main(int argc, char** argv) {
     if (!user_gap_open) params.gap_open = best.gap_open;
     if (!user_gap_extend) params.gap_extend = best.gap_extend;
     std::cout << "\nOptimal parameters found: GAP_OPEN=" << params.gap_open
-              << ", GAP_EXTEND=" << params.gap_extend
+              << ", GAP_EXTEND="
+              << params.gap_extend
               // << " with score: " << best.score << "\n"
               << std::endl;
   } else {
@@ -3545,7 +3588,8 @@ int main(int argc, char** argv) {
         if (!u) continue;
         if (u->leaf) {
           int idx = u->seq_index;
-          if (idx < 0 || idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
+          if (idx < 0 ||
+              idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
             std::cerr << "\nFATAL LOGIC ERROR: Invalid seq_index " << idx
                       << std::endl;
             free_tree(root);
@@ -3562,19 +3606,19 @@ int main(int argc, char** argv) {
 
     // Run the three progressive alignment strategies in parallel
     std::vector<std::string> msa_nw, msa_fft, msa_le;
-    long long score_nw = LLONG_MIN;
-    long long score_fft = LLONG_MIN;
-    long long score_le = LLONG_MIN;
+    long long                score_nw  = LLONG_MIN;
+    long long                score_fft = LLONG_MIN;
+    long long                score_le  = LLONG_MIN;
 
-#pragma omp parallel sections default(none) \
+#pragma omp parallel sections default(none)                                   \
     shared(make_tree, msa_nw, msa_fft, msa_le, score_nw, score_fft, score_le, \
-           mode, fn, params, seqs, pl)
+               mode, fn, params, seqs, pl)
     {
 #pragma omp section
       {
         Node* root_nw = make_tree();
         if (root_nw) {
-          msa_nw = build_profile(root_nw, seqs, mode, fn, params);
+          msa_nw   = build_profile(root_nw, seqs, mode, fn, params);
           score_nw = calculate_sp_score(msa_nw, mode, fn, params);
           free_tree(root_nw);
         }
@@ -3583,7 +3627,7 @@ int main(int argc, char** argv) {
       {
         Node* root_fft = make_tree();
         if (root_fft) {
-          msa_fft = build_profile_fft(root_fft, seqs, mode, fn, params);
+          msa_fft   = build_profile_fft(root_fft, seqs, mode, fn, params);
           score_fft = calculate_sp_score(msa_fft, mode, fn, params);
           free_tree(root_fft);
         }
@@ -3592,8 +3636,9 @@ int main(int argc, char** argv) {
       {
         Node* root_le = make_tree();
         if (root_le) {
-          auto le_result = build_profile_le(root_le, seqs, pl, mode, fn, params);
-          msa_le = le_result.profile;
+          auto le_result =
+              build_profile_le(root_le, seqs, pl, mode, fn, params);
+          msa_le   = le_result.profile;
           score_le = calculate_sp_score(msa_le, mode, fn, params);
           free_tree(root_le);
         }
@@ -3602,18 +3647,17 @@ int main(int argc, char** argv) {
 
     // Select best initial alignment
     std::vector<std::string> msa;
-    std::string best_method;
-    long long best_score = score_nw;
-    msa = msa_nw;
-    best_method = "Progressive NW";
+    std::string              best_method;
+    long long                best_score = score_nw;
+    msa                                 = msa_nw;
+    best_method                         = "Progressive NW";
     if (score_fft >= best_score) {
-      best_score = score_fft;
-      msa = msa_fft;
+      best_score  = score_fft;
+      msa         = msa_fft;
       best_method = "FFT-Seeded Banded";
     }
     if (score_le >= best_score) {
-      best_score = score_le;
-      msa = msa_le;
+      msa         = msa_le;
       best_method = "COFFEE LE-Guided";
     }
 
@@ -3630,8 +3674,8 @@ int main(int argc, char** argv) {
     std::string job_id = generate_job_id();
 
     // Determine file paths with required naming scheme
-    std::string prefix = outdir + "/" + job_id;
-    std::map<std::string,std::string> outputs;
+    std::string                        prefix = outdir + "/" + job_id;
+    std::map<std::string, std::string> outputs;
     // Sequence file
     std::string seq_file = prefix + ".sequence";
     {
@@ -3641,10 +3685,11 @@ int main(int argc, char** argv) {
       }
       for (std::size_t i = 0; i < hdrs.size(); ++i) {
         seq_out << ">" << hdrs[i] << "\n";
-        const std::string& s = seqs[i];
-        const std::size_t wrap_width = 80;
+        const std::string& s          = seqs[i];
+        const std::size_t  wrap_width = 80;
         for (std::size_t pos = 0; pos < s.size(); pos += wrap_width) {
-          seq_out << s.substr(pos, std::min(wrap_width, s.size() - pos)) << "\n";
+          seq_out << s.substr(pos, std::min(wrap_width, s.size() - pos))
+                  << "\n";
         }
       }
       seq_out.close();
@@ -3677,14 +3722,14 @@ int main(int argc, char** argv) {
     outputs["percent_identity_matrix"] = pim_file;
     // Metadata JSON
     std::string metadata_file = prefix + ".metadata.json";
-    outputs["metadata"] = metadata_file;
+    outputs["metadata"]       = metadata_file;
     // We'll fill after writing metadata
     // Submission XML
     std::string submission_file = prefix + ".submission";
-    outputs["submission"] = submission_file;
+    outputs["submission"]       = submission_file;
     // Placeholder for zip path
     std::string zip_file = prefix + ".zip";
-    outputs["zip"] = zip_file;
+    outputs["zip"]       = zip_file;
 
     // Compose command line string
     std::ostringstream cmdline_ss;
@@ -3698,11 +3743,12 @@ int main(int argc, char** argv) {
     std::string seq_type = (mode == MODE_PROTEIN ? "protein" : "dna");
 
     // Record end time and compute duration
-    auto run_end_point = std::chrono::system_clock::now();
-    double duration_seconds = std::chrono::duration<double>(run_end_point - run_start_point).count();
+    auto   run_end_point = std::chrono::system_clock::now();
+    double duration_seconds =
+        std::chrono::duration<double>(run_end_point - run_start_point).count();
     // ISO format times
     auto to_iso = [](std::chrono::system_clock::time_point tp) {
-      auto tt = std::chrono::system_clock::to_time_t(tp);
+      auto    tt = std::chrono::system_clock::to_time_t(tp);
       std::tm tm{};
 #ifdef _WIN32
       gmtime_s(&tm, &tt);
@@ -3714,10 +3760,10 @@ int main(int argc, char** argv) {
       return oss.str();
     };
     std::string start_iso = to_iso(run_start_point);
-    std::string end_iso = to_iso(run_end_point);
+    std::string end_iso   = to_iso(run_end_point);
     // Determine number of threads
-    int num_threads = omp_get_max_threads();
-    bool avx2_enabled = true; // assume compiled with AVX2
+    int  num_threads  = omp_get_max_threads();
+    bool avx2_enabled = true;  // assume compiled with AVX2
 #ifdef __AVX2__
     avx2_enabled = true;
 #else
@@ -3728,13 +3774,15 @@ int main(int argc, char** argv) {
     openmp_enabled = false;
 #endif
     // Write metadata JSON
-    write_metadata_json(metadata_file, job_id, "msalign-compatible-tool", "1.0", start_iso, end_iso,
-                        duration_seconds, cmdline, seq_file, seq_type, hdrs,
-                        num_threads, avx2_enabled, openmp_enabled,
-                        "global_alignment_identity", "UPGMA",
-                        best_method, "iterative_split_refinement", best_method, outputs);
+    write_metadata_json(metadata_file, job_id, "msalign-compatible-tool", "1.0",
+                        start_iso, end_iso, duration_seconds, cmdline, seq_file,
+                        seq_type, hdrs, num_threads, avx2_enabled,
+                        openmp_enabled, "global_alignment_identity", "UPGMA",
+                        best_method, "iterative_split_refinement", best_method,
+                        outputs);
     // Write submission XML
-    write_submission_xml(submission_file, job_id, cmdline, hdrs, outputs, seq_type);
+    write_submission_xml(submission_file, job_id, cmdline, hdrs, outputs,
+                         seq_type);
     // Create zip archive containing outputs
     {
       std::ostringstream file_list;
@@ -3746,9 +3794,10 @@ int main(int argc, char** argv) {
       file_list << " \"" << metadata_file << "\"";
       file_list << " \"" << submission_file << "\"";
       std::string cmd = "zip -j -q \"" + zip_file + "\"" + file_list.str();
-      int rc = std::system(cmd.c_str());
+      int         rc  = std::system(cmd.c_str());
       if (rc != 0) {
-        std::cerr << "Warning: zip command returned non-zero exit code" << std::endl;
+        std::cerr << "Warning: zip command returned non-zero exit code"
+                  << std::endl;
       }
     }
   } catch (const std::exception& e) {
