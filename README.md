@@ -9,47 +9,50 @@
 
 ## [Documentation](https://bibymaths.github.io/SequenceMSAligner/)
 
---- 
-
-## Features
-
-- Supports **DNA** (EDNAFULL matrix) and **Protein** (BLOSUM62 matrix) modes
-- AVX2-vectorized Needleman-Wunsch global alignment (affine gap penalties)
-- UPGMA guide tree with Newick output
-- Parallel iterative refinement (OpenMP multi-threaded)
-- Automatic grid search for optimal gap penalties
-- HTML visualization output with color-coded conservation
-- Sum-of-Pairs (SP) scoring for alignment quality
-
 ---
-
-## Output Files
-
-| File                     | Description                       |
-|--------------------------|-----------------------------------|
-| `msa.fasta`              | Final MSA in FASTA format         |
-| `msa_visualization.html` | Color-coded HTML alignment viewer |
-| `guide_tree.nwk`         | UPGMA guide tree in Newick format |
-| `consensus.fasta`        | Consensus sequence                |
-| `consensus_details.txt`  | Per-column consensus match report |
-| `identity_matrix.txt`    | Pairwise sequence identity matrix |
-
---- 
 
 ## Quick Start
 
+Download the prebuilt Linux x86_64 binary:
+
 ```bash
-# Compile
-g++ -O3 -mavx2 -fopenmp -std=c++17 -o msa main.cpp
+wget https://github.com/bibymaths/SequenceMSAligner/releases/download/v0.9.0/msalign-linux-x86_64
+chmod +x msalign-linux-x86_64
+````
 
-# DNA alignment
-./msa --mode dna out_dir seq1.fasta seq2.fasta seq3.fasta
+Run DNA alignment:
 
-# Protein alignment with custom gap penalties
-./msa --mode protein --gap_open -12 --gap_extend -2 out_dir p1.fasta p2.fasta
+```bash
+./msalign-linux-x86_64 \
+  --mode=dna \
+  --gap-open=-10 \
+  --gap-extend=-0.5 \
+  results \
+  seq1.fasta seq2.fasta seq3.fasta
 ```
 
----
+Run protein alignment:
+
+```bash
+./msalign-linux-x86_64 \
+  --mode=protein \
+  --gap-open=-12 \
+  --gap-extend=-2 \
+  results \
+  p1.fasta p2.fasta p3.fasta
+```
+
+Build from source with CMake:
+
+```bash
+git clone https://github.com/bibymaths/SequenceMSAligner.git
+cd SequenceMSAligner
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/msalign --mode=dna --gap-open=-10 --gap-extend=-0.5 results seq1.fasta seq2.fasta seq3.fasta
+```
+
+--- 
 
 ## References
 

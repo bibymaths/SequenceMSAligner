@@ -2784,8 +2784,11 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
       {
         std::string safeHdr = htmlEscape(hdrs[i]);
         html_file << "<span class=\"header\" title=\"" << safeHdr << "\">"
-                  << safeHdr << "</span>"
-                  << "<span class=\"position\">" << block_start[i] << "</span>"
+                  << safeHdr
+                  << "</span>"
+                  << "<span class=\"position\">"
+                  << block_start[i]
+                  << "</span>"
                   << "<span class=\"sequence-block\">";
       }
 
