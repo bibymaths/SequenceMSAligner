@@ -43,6 +43,8 @@
 #include <utility>
 #include <valarray>
 #include <vector>
+#include <unordered_set>
+#include <unordered_map>
 
 #include "EBLOSUM62.h"
 #include "EDNAFULL.h"
@@ -366,8 +368,10 @@ std::pair<int, double> fftCrossCorrelation(const std::string& a,
 /**
  * @brief Replaces all whitespace characters in a FASTA header with underscores.
  *
- * This normalization ensures headers can be used as identifiers in Newick
- * strings and output filenames without quoting or escaping.
+ * This function is retained for backwards compatibility but is no longer used
+ * as the primary header normalisation mechanism. It simply replaces any
+ * whitespace with an underscore. New code should prefer
+ * canonicalize_fasta_header() which performs more robust parsing.
  *
  * @param[in,out] header FASTA header string to sanitize in place.
  */
@@ -380,17 +384,192 @@ void sanitize_header(std::string& header) {
 }
 
 /**
+ * @brief Produce a canonical identifier for a FASTA header.
+ *
+ * The canonical name is used internally to identify sequences and to label
+ * output files. It is derived from the first whitespace‐delimited token of
+ * the header (or the UniProt accession for protein sequences) and then
+ * cleansed of characters that could confuse Newick parsers or file systems.
+ *
+ * Behaviour by mode:
+ *  - **Protein mode**: If the header contains pipe characters (e.g.
+ *    "sp|P12345|NAME"), extract the accession between the first two pipes.
+ *    Otherwise take the first token before any whitespace. The accession
+ *    characters are then mapped: letters, digits, underscores and hyphens
+ *    are kept as–is; periods (`.`) and other punctuation are replaced
+ *    with underscores.
+ *  - **DNA mode**: Take the first token before any whitespace. Do **not**
+ *    split on underscores or other punctuation. All characters other than
+ *    alphanumerics, underscores or hyphens are replaced with underscores.
+ *    Dots are replaced with underscores to avoid confusion with branch
+ *    lengths in Newick strings.
+ *
+ * In both modes, leading '>' is removed if present and leading/trailing
+ * whitespace is trimmed. Internal whitespace is not expected in the token
+ * because splitting stops at the first whitespace character. Characters
+ * ":", ",", "(", ")" and ";" are converted to underscores.
+ *
+ * @param header Raw FASTA header line without the leading '>'
+ * @param mode Scoring mode specifying DNA or protein behaviour
+ * @return Canonicalised header string safe for internal use
+ */
+std::string canonicalize_fasta_header(std::string header, ScoreMode mode) {
+  // Trim leading '>' if provided inadvertently
+  if (!header.empty() && header[0] == '>') {
+    header.erase(header.begin());
+  }
+  // Trim leading whitespace
+  auto lpos = header.find_first_not_of(" \t\r\n");
+  auto rpos = header.find_last_not_of(" \t\r\n");
+  if (lpos == std::string::npos) {
+    header.clear();
+  } else {
+    header = header.substr(lpos, rpos - lpos + 1);
+  }
+  std::string token;
+  if (mode == MODE_PROTEIN) {
+    // UniProt style: sp|P12345|NAME
+    size_t p1 = header.find('|');
+    size_t p2 = (p1 == std::string::npos ? std::string::npos : header.find('|', p1 + 1));
+    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1 + 1) {
+      token = header.substr(p1 + 1, p2 - p1 - 1);
+    } else {
+      // Otherwise take the first token before whitespace
+      size_t ws = header.find_first_of(" \t\r\n");
+      token = (ws != std::string::npos) ? header.substr(0, ws) : header;
+    }
+  } else {
+    // DNA mode: first token before whitespace
+    size_t ws = header.find_first_of(" \t\r\n");
+    token = (ws != std::string::npos) ? header.substr(0, ws) : header;
+  }
+  // Build canonical name by replacing unsafe characters
+  std::string canonical;
+  canonical.reserve(token.size());
+  for (char c : token) {
+    // Accept letters, digits, underscore and hyphen directly
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
+      canonical.push_back(c);
+    } else if (c == '.') {
+      // Replace dot with underscore to disambiguate accession dot from branch length
+      canonical.push_back('_');
+    } else {
+      // Replace all other characters (including punctuation and whitespace) with underscore
+      canonical.push_back('_');
+    }
+  }
+  return canonical;
+}
+
+/**
+ * @brief Generate a list of stable internal labels for tree construction.
+ *
+ * Internal labels take the form "SEQ_0", "SEQ_1", ... up to n-1. These
+ * labels are used inside the guide tree to avoid ambiguities caused by
+ * biological headers containing punctuation, whitespace or duplicate
+ * substrings. The mapping from internal label to original sequence index
+ * is implicit via the suffix number.
+ *
+ * @param n Number of sequences
+ * @return Vector of size @p n containing labels SEQ_0 .. SEQ_{n-1}
+ */
+std::vector<std::string> make_internal_tree_labels(std::size_t n) {
+  std::vector<std::string> labels;
+  labels.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    labels.emplace_back("SEQ_" + std::to_string(i));
+  }
+  return labels;
+}
+
+/**
+ * @brief Verify that a set of headers are unique.
+ *
+ * Throws a runtime_error if any duplicate header is found. This ensures the
+ * downstream mapping from header to sequence index is one-to-one.
+ *
+ * @param hdrs Vector of header strings
+ */
+void validate_headers_unique(const std::vector<std::string>& hdrs) {
+  std::unordered_set<std::string> seen;
+  for (const auto& h : hdrs) {
+    if (!seen.insert(h).second) {
+      throw std::runtime_error("Duplicate header detected: " + h);
+    }
+  }
+}
+
+/**
+ * @brief Validate that the final MSA has the expected number of rows.
+ *
+ * If the number of rows differs from @p expected_rows an exception is
+ * thrown. This prevents silent production of incomplete alignments when
+ * guide tree parsing fails.
+ *
+ * @param msa Vector of aligned sequences
+ * @param expected_rows Expected number of rows corresponding to input sequences
+ */
+void validate_msa_shape(const std::vector<std::string>& msa,
+                        std::size_t                    expected_rows) {
+  if (msa.size() != expected_rows) {
+    std::ostringstream oss;
+    oss << "MSA row count (" << msa.size()
+        << ") != expected header count (" << expected_rows << ")";
+    throw std::runtime_error(oss.str());
+  }
+}
+
+/**
+ * @brief Escape special characters for safe inclusion in HTML.
+ *
+ * Converts &, <, >, " and ' into their corresponding HTML entities. This
+ * prevents malformed HTML when sequence headers contain special characters.
+ *
+ * @param s Input string
+ * @return Escaped string safe to embed in HTML
+ */
+static std::string htmlEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    switch (c) {
+      case '&':
+        out += "&amp;";
+        break;
+      case '<':
+        out += "&lt;";
+        break;
+      case '>':
+        out += "&gt;";
+        break;
+      case '"':
+        out += "&quot;";
+        break;
+      case '\'':
+        out += "&#39;";
+        break;
+      default:
+        out.push_back(c);
+    }
+  }
+  return out;
+}
+
+/**
  * @brief Reads a FASTA file and extracts the first sequence record.
  *
  * Only the first header line (the line beginning with @c '>') is captured.
- * All subsequent sequence lines are concatenated into a single uppercase
- * string with non-alphabetic characters silently discarded.
- * Multi-record FASTA files are partially read ? only the first record is used.
+ * Sequence lines following that header are concatenated into a single
+ * uppercase string with non-alphabetic characters silently discarded.
+ * If a second header line is encountered, the function stops reading
+ * further records. This enforces the one-sequence-per-file convention
+ * expected by the CLI.
  *
  * @param fn   Path to the FASTA file to read.
  * @param[out] hdr Header string without the leading @c '>' character.
  * @param[out] seq Uppercase sequence with all non-alpha characters removed.
- * @throws std::runtime_error if the file cannot be opened.
+ * @throws std::runtime_error if the file cannot be opened, if no header
+ *         is found or if the first record contains no sequence.
  */
 void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
   std::ifstream f(fn);
@@ -399,22 +578,36 @@ void processFasta(const std::string& fn, std::string& hdr, std::string& seq) {
   seq.clear();
   std::string line;
   bool        gotHdr = false;
-
   while (std::getline(f, line)) {
     if (line.empty()) continue;
     if (line[0] == '>') {
-      if (!gotHdr) {  // only first header
+      if (!gotHdr) {
+        // Capture the first header without the leading '>'
         hdr    = line.substr(1);
         gotHdr = true;
+      } else {
+        // Second header encountered – stop reading further records
+        break;
       }
       continue;
     }
-    // sanitize: for each char, if A?Z or a?z, convert to uppercase and append
+    if (!gotHdr) {
+      // Skip any leading sequence lines before the first header
+      continue;
+    }
+    // Append only alphabetic characters (converted to uppercase) to the sequence
     for (char c : line) {
       if (std::isalpha(static_cast<unsigned char>(c))) {
         seq.push_back(std::toupper(static_cast<unsigned char>(c)));
       }
     }
+  }
+  // Validate that we found both a header and a sequence
+  if (!gotHdr) {
+    throw std::runtime_error("No FASTA header found in " + fn);
+  }
+  if (seq.empty()) {
+    throw std::runtime_error("No sequence found in the first record of " + fn);
   }
 }
 
@@ -1113,6 +1306,10 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
   const int num_seqs    = checked_size_to_int(msa.size(), "msa.size()");
   const int align_len   = checked_size_to_int(msa[0].size(), "msa[0].size()");
 
+  // Mode is not used directly here because the scoring behaviour is
+  // encapsulated in the function pointer fn. Avoid unused parameter warning.
+  (void)mode;
+
   // Iterate over every unique pair of sequences in the alignment (i and k)
   for (int i = 0; i < num_seqs; ++i) {
     for (int k = i + 1; k < num_seqs; ++k) {
@@ -1129,7 +1326,8 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
         if (char_i != '-' && char_k != '-') {
           // --- Case 1: Residue vs Residue ---
           // This is a standard match/mismatch.
-          total_score += score(char_i, char_k, mode);
+          // Use the provided scoring function pointer for substitution
+          total_score += fn(char_i, char_k);
           in_gap_for_this_pair = false;  // The gap (if any) has ended.
 
         } else if (char_i !=
@@ -1246,39 +1444,6 @@ void projectGaps(const std::string& oldc, const std::string& newc,
     }
 
     s = std::move(result);
-  }
-}
-
-static void remove_all_gap_columns(std::vector<std::string>& profile) {
-  if (profile.empty()) return;
-
-  std::size_t max_len = 0;
-  for (const auto& row : profile) {
-    max_len = std::max(max_len, row.size());
-  }
-
-  std::vector<std::size_t> keep_cols;
-  keep_cols.reserve(max_len);
-
-  for (std::size_t j = 0; j < max_len; ++j) {
-    bool all_gap = true;
-    for (const auto& row : profile) {
-      char c = (j < row.size()) ? row[j] : '-';
-      if (c != '-') {
-        all_gap = false;
-        break;
-      }
-    }
-    if (!all_gap) keep_cols.push_back(j);
-  }
-
-  for (auto& row : profile) {
-    std::string trimmed;
-    trimmed.reserve(keep_cols.size());
-    for (std::size_t j : keep_cols) {
-      trimmed.push_back((j < row.size()) ? row[j] : '-');
-    }
-    row.swap(trimmed);
   }
 }
 
@@ -1630,13 +1795,21 @@ int computeBandedAlignment(const std::string& x, const std::string& y,
  * @see fftCrossCorrelation(), computeBandedAlignment(), projectGaps(),
  *      build_profile(), build_profile_le()
  */
-std::vector<std::string> build_profile_fft(Node* n, ScoreMode mode, ScoreFn fn,
+std::vector<std::string> build_profile_fft(Node* n, const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
                                            const AlignParams& p) {
   if (!n) return {};
-  if (n->leaf) return n->profile;   // FIX
+  if (n->leaf) {
+    int idx = n->seq_index;
+    if (idx < 0 || idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
+      std::ostringstream oss;
+      oss << "Invalid leaf sequence index " << idx;
+      throw std::runtime_error(oss.str());
+    }
+    return { seqs[idx] };
+  }
 
-  auto A = build_profile_fft(n->left, mode, fn, p);
-  auto B = build_profile_fft(n->right, mode, fn, p);
+  auto A = build_profile_fft(n->left, seqs, mode, fn, p);
+  auto B = build_profile_fft(n->right, seqs, mode, fn, p);
 
   std::string consA = generate_consensus(A);
   std::string consB = generate_consensus(B);
@@ -1756,7 +1929,13 @@ LENode build_profile_le(Node* n, const std::vector<std::string>& raw_seqs,
                         const AlignParams& p) {
   if (!n) return {};
   if (n->leaf) {
-    return {{raw_seqs[n->seq_index]}, {n->seq_index}};
+    int idx = n->seq_index;
+    if (idx < 0 || idx >= checked_size_to_int(raw_seqs.size(), "raw_seqs.size()")) {
+      std::ostringstream oss;
+      oss << "Invalid leaf sequence index " << idx;
+      throw std::runtime_error(oss.str());
+    }
+    return {{raw_seqs[idx]}, {idx}};
   }
 
   auto L = build_profile_le(n->left, raw_seqs, pl, mode, fn, p);
@@ -1840,11 +2019,28 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
 }
 
 /**
- * @brief Build UPGMA tree via a min-heap in O(n^2 log n).
+ * @brief Build a UPGMA guide tree via a min-heap in O(n^2 log n).
  *
- * @param D     Symmetric distance matrix.
- * @param names Cluster labels (will be updated in place).
- * @return      Newick string.
+ * This function performs agglomerative clustering under the UPGMA
+ * algorithm. Each initial cluster is labelled by an entry from the
+ * @p names vector. When two clusters merge, their labels are combined
+ * into a parenthesis-delimited Newick subtree annotated with a branch
+ * length equal to half the distance between them. The returned string is
+ * the final Newick tree terminated by a semicolon. The input
+ * @p names vector is passed by value so modifications do not affect
+ * the caller. Labels should be unique; no validation is performed here.
+ *
+ * The distance update uses the classical UPGMA formula, computing a
+ * weighted average of distances between the two merged clusters and all
+ * remaining clusters based on the size of each cluster *before* the merge.
+ * This avoids biasing the average by the newly combined cluster size.
+ *
+ * @param D Symmetric distance matrix.
+ * @param names Cluster labels for the leaves. Each label will appear exactly
+ *              once in the returned Newick string. Passing stable internal
+ *              labels (e.g. "SEQ_0", "SEQ_1", ...) is recommended to
+ *              avoid ambiguity.
+ * @return Newick string representing the guide tree.
  */
 std::string buildUPGMATree(std::vector<std::vector<double>> D,
                            std::vector<std::string>         names) {
@@ -1880,7 +2076,10 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
     nw << "(" << C[a].nwk << ":" << half << "," << C[b].nwk << ":" << half
        << ")";
     C[a].nwk = nw.str();
-    C[a].size += C[b].size;
+    // Capture cluster sizes before update
+    int size_a = C[a].size;
+    int size_b = C[b].size;
+    C[a].size  = size_a + size_b;
     alive[b] = false;
     --remaining;
 
@@ -1888,8 +2087,8 @@ std::string buildUPGMATree(std::vector<std::vector<double>> D,
     for (int k = 0; k < n; ++k) {
       if (alive[k] && k != a) {
         // weighted average
-        double dk = (D[a][k] * C[a].size + D[b][k] * C[b].size) /
-                    (C[a].size + C[b].size);
+        double dk = (D[a][k] * size_a + D[b][k] * size_b) /
+                    static_cast<double>(size_a + size_b);
         D[a][k] = D[k][a] = dk;
         pq.emplace(dk, a, k);
       }
@@ -1940,7 +2139,7 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
     if (split_point == 0 || split_point >= indices.size()) continue;
 
     std::vector<std::string> profileA, profileB;
-    std::vector<int> idxA, idxB;
+    std::vector<int>         idxA,    idxB;
     profileA.reserve(split_point);
     profileB.reserve(indices.size() - split_point);
     idxA.reserve(split_point);
@@ -1955,21 +2154,25 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
       profileB.push_back(best_msa[indices[t]]);
     }
 
-    remove_all_gap_columns(profileA);
-    remove_all_gap_columns(profileB);
-
-    if (profileA.empty() || profileB.empty()) continue;
-
+    // Build consensus directly from full profiles — do NOT strip gap columns.
+    // generate_consensus() already skips gap-only columns via the plurality
+    // vote; projectGaps() handles the column structure correctly.
     std::string repA = generate_consensus(profileA);
     std::string repB = generate_consensus(profileB);
 
-    if (repA.empty() || repB.empty()) continue;
+    // Strip gap characters from the consensus before alignment so that we
+    // pass ungapped sequences to computeGlobalAlignment (it expects raw seqs).
+    std::string ungapped_repA = ungap(repA);
+    std::string ungapped_repB = ungap(repB);
+
+    if (ungapped_repA.empty() || ungapped_repB.empty()) continue;
 
     std::string aligned_repA, aligned_repB;
-    computeGlobalAlignment(repA, repB, mode, fn, aligned_repA, aligned_repB, p);
+    computeGlobalAlignment(ungapped_repA, ungapped_repB, mode, fn,
+                           aligned_repA, aligned_repB, p);
 
-    projectGaps(repA, aligned_repA, profileA);
-    projectGaps(repB, aligned_repB, profileB);
+    projectGaps(ungapped_repA, aligned_repA, profileA);
+    projectGaps(ungapped_repB, aligned_repB, profileB);
 
     std::vector<std::string> new_msa(best_msa.size());
     for (std::size_t k = 0; k < idxA.size(); ++k) new_msa[idxA[k]] = profileA[k];
@@ -2198,10 +2401,13 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
       html_file << "<div class=\"line-container\">";
 
       // Layout: [Header] [Start Pos] [Sequence] [End Pos]
-      html_file << R"(<span class="header" title=")" << hdrs[i] << "\">"
-                << hdrs[i] << "</span>"
-                << "<span class=\"position\">" << block_start[i] << "</span>"
-                << "<span class=\"sequence-block\">";
+      {
+        std::string safeHdr = htmlEscape(hdrs[i]);
+        html_file << "<span class=\"header\" title=\"" << safeHdr
+                  << "\">" << safeHdr << "</span>"
+                  << "<span class=\"position\">" << block_start[i]
+                  << "</span>" << "<span class=\"sequence-block\">";
+      }
 
       // Write the colored characters for the current block
       for (size_t j = start_col; j < end_col; ++j) {
@@ -2274,104 +2480,137 @@ std::vector<std::string> msa_star(const std::vector<std::string>& hdrs,
 }
 
 /**
- * @brief Parses a Newick formatted tree string into a binary tree structure.
- * This function constructs a binary tree from a Newick string, where each leaf
- * node corresponds to a sequence index from the provided names vector.
+ * @brief Parses a Newick formatted guide tree into a binary Node tree.
  *
- * @param nwk The Newick formatted string representing the guide tree.
+ * Leaf labels in the Newick string must exactly match entries in @p names;
+ * internal nodes are implied by parentheses and do not carry names. Branch
+ * lengths following a colon (":") are ignored and skipped. Whitespace is
+ * ignored. If a leaf label is not found in @p names or if the Newick string
+ * is malformed (e.g. mismatched parentheses or nodes with more than two
+ * children), a std::runtime_error is thrown. The caller is responsible for
+ * freeing the returned tree via @c free_tree().
+ *
+ * @param nwk Newick formatted string representing the guide tree.
  * @param names A vector of sequence names corresponding to the leaf nodes.
- * @return A pointer to the root of the constructed binary tree.
+ *              The index in this vector is used as the Node::seq_index.
+ * @return Pointer to the root of the constructed binary tree.
+ * @throws std::runtime_error if a leaf label is missing from @p names or if
+ *         the tree is structurally invalid.
  */
 Node* parseNewick(const std::string&              nwk,
                   const std::vector<std::string>& names) {
-  auto find_name_index = [&](const std::string& name) {
-    for (size_t i = 0; i < names.size(); ++i) {
-      if (names[i] == name) {
-        return static_cast<int>(i);
-      }
+  // Build a name->index lookup for quick leaf lookup
+  std::unordered_map<std::string, int> name_to_index;
+  name_to_index.reserve(names.size());
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    // duplicate names have already been checked upstream
+    name_to_index.emplace(names[i], static_cast<int>(i));
+  }
+  // Helper to attach a leaf with the given token to the current parent
+  auto attach_leaf = [&](const std::string& label, std::stack<Node*>& st,
+                         Node*& root) {
+    if (label.empty()) return;
+    auto it = name_to_index.find(label);
+    if (it == name_to_index.end()) {
+      throw std::runtime_error("Guide tree leaf label '" + label +
+                               "' was not found in the sequence label map");
     }
-
-    std::cerr << "\nFATAL PARSING ERROR: The name '" << name
-              << "' from the guide tree was not found in the list of input "
-                 "sequence headers."
-              << std::endl;
-    return -1;
-  };
-
-  std::stack<Node*> node_stack;
-  Node*             root = nullptr;
-  std::string       current_text;
-
-  auto attach_leaf = [&](const std::string& name) {
-    Node* leaf = new Node{true, find_name_index(name), {}, nullptr, nullptr};
-
-    if (node_stack.empty()) {
-      if (root != nullptr) {
-        free_tree(root);
+    Node* leaf = new Node{true, it->second, {}, nullptr, nullptr};
+    if (st.empty()) {
+      // If no context, this is the root
+      if (root) {
+        // existing root – orphaned leaf, free and throw
+        delete leaf;
+        throw std::runtime_error("Multiple roots encountered in Newick parse");
       }
       root = leaf;
       return;
     }
-
-    Node* parent = node_stack.top();
-    if (parent->left == nullptr) {
+    Node* parent = st.top();
+    if (!parent->left) {
       parent->left = leaf;
-    } else {
+    } else if (!parent->right) {
       parent->right = leaf;
+    } else {
+      // Parent already has two children – invalid binary tree
+      delete leaf;
+      throw std::runtime_error("Invalid guide tree: node has more than two children");
     }
   };
-
-  for (size_t i = 0; i < nwk.length(); ++i) {
+  std::stack<Node*> st;
+  Node* root = nullptr;
+  std::string token;
+  for (std::size_t i = 0; i < nwk.size(); ++i) {
     char c = nwk[i];
-
     if (std::isspace(static_cast<unsigned char>(c))) {
       continue;
     }
-
-    if (c == ',' || c == ')' || c == ':' || c == ';') {
-      if (!current_text.empty()) {
-        attach_leaf(current_text);
-        current_text.clear();
-      }
-
-      if (c == ')') {
-        if (!node_stack.empty()) {
-          node_stack.pop();
-        }
-      } else if (c == ':') {
-        while (i + 1 < nwk.length() &&
-               (std::isdigit(static_cast<unsigned char>(nwk[i + 1])) ||
-                nwk[i + 1] == '.' || nwk[i + 1] == 'e' || nwk[i + 1] == 'E' ||
-                nwk[i + 1] == '-' || nwk[i + 1] == '+')) {
-          ++i;
-        }
-      }
-    } else if (c == '(') {
-      Node* new_node = new Node{false, -1, {}, nullptr, nullptr};
-
-      if (root == nullptr) {
-        root = new_node;
-      }
-
-      if (!node_stack.empty()) {
-        Node* parent = node_stack.top();
-        if (parent->left == nullptr) {
-          parent->left = new_node;
+    if (c == '(') {
+      // Start a new internal node
+      Node* node = new Node{false, -1, {}, nullptr, nullptr};
+      if (!st.empty()) {
+        Node* parent = st.top();
+        if (!parent->left) {
+          parent->left = node;
+        } else if (!parent->right) {
+          parent->right = node;
         } else {
-          parent->right = new_node;
+          delete node;
+          throw std::runtime_error("Invalid guide tree: node has more than two children");
+        }
+      } else if (!root) {
+        root = node;
+      } else {
+        delete node;
+        throw std::runtime_error("Multiple roots encountered in Newick parse");
+      }
+      st.push(node);
+    } else if (c == ',') {
+      // Finish the preceding token as a leaf
+      attach_leaf(token, st, root);
+      token.clear();
+    } else if (c == ')') {
+      // Finish the preceding token as a leaf
+      attach_leaf(token, st, root);
+      token.clear();
+      // Pop current internal node
+      if (st.empty()) {
+        throw std::runtime_error("Invalid guide tree: unmatched ')'");
+      }
+      st.pop();
+    } else if (c == ':') {
+      // Finish label before branch length
+      attach_leaf(token, st, root);
+      token.clear();
+      // Skip branch length field (digits, decimal point, exponent, sign)
+      std::size_t j = i + 1;
+      while (j < nwk.size()) {
+        char d = nwk[j];
+        if (std::isdigit(static_cast<unsigned char>(d)) || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-') {
+          ++j;
+        } else {
+          break;
         }
       }
-
-      node_stack.push(new_node);
+      i = j - 1;
+    } else if (c == ';') {
+      // Finish any trailing token and break
+      attach_leaf(token, st, root);
+      token.clear();
+      break;
     } else {
-      current_text += c;
+      // Accumulate label characters
+      token += c;
     }
   }
-
-  if (!current_text.empty()) {
-    attach_leaf(current_text);
+  // Final trailing label if any
+  if (!token.empty()) {
+    attach_leaf(token, st, root);
+    token.clear();
   }
-
+  if (!st.empty()) {
+    throw std::runtime_error("Invalid guide tree: unmatched '(' characters");
+  }
   return root;
 }
 
@@ -2433,11 +2672,12 @@ std::string formatNewickString(const std::string& nwk) {
  * aligning child profiles and projecting gaps as necessary.
  *
  * @param n The current node in the binary tree.
+ * @param seqs The original sequences used to build the tree.
  * @param mode The scoring mode (DNA or Protein).
  * @param fn The scoring function to use.
  * @return A vector of aligned sequences representing the profile at this node.
  */
-std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn,
+std::vector<std::string> build_profile(Node* n, const std::vector<std::string>& seqs, ScoreMode mode, ScoreFn fn,
                                        const AlignParams& p) {
   // Safety check for null pointers passed from parent nodes
   if (!n) {
@@ -2447,12 +2687,19 @@ std::vector<std::string> build_profile(Node* n, ScoreMode mode, ScoreFn fn,
   // Case 1: The node is a leaf. Its profile (a single sequence)
   // was already seeded in the main() function. Just return it.
   if (n->leaf) {
-    return n->profile;
+    // Validate leaf index before dereferencing
+    int idx = n->seq_index;
+    if (idx < 0 || idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
+      std::ostringstream oss;
+      oss << "Invalid leaf sequence index " << idx;
+      throw std::runtime_error(oss.str());
+    }
+    return { seqs[idx] };
   }
 
   // Recursively build the profiles for the children.
-  auto A = build_profile(n->left, mode, fn, p);
-  auto B = build_profile(n->right, mode, fn, p);
+  auto A = build_profile(n->left, seqs, mode, fn, p);
+  auto B = build_profile(n->right, seqs, mode, fn, p);
 
   // Case 2: The node is "unary" (has only one child profile).
   // No alignment is needed. The profile is just the child's profile.
@@ -2569,29 +2816,48 @@ GapSearchResult find_optimal_gap_penalties(
       p.gap_open   = open_penalties[i];
       p.gap_extend = extend_penalties[j];
 
-      auto  D    = computeDistanceMatrix(initial_seqs, mode, fn, p);
-      auto  nwk  = buildUPGMATree(D, initial_hdrs);
-      Node* root = parseNewick(nwk, initial_hdrs);
-
+      auto D = computeDistanceMatrix(initial_seqs, mode, fn, p);
+      // Build guide tree using stable internal labels
+      std::vector<std::string> internal_labels =
+          make_internal_tree_labels(initial_hdrs.size());
+      auto nwk = buildUPGMATree(D, internal_labels);
+      Node* root = nullptr;
+      try {
+        root = parseNewick(nwk, internal_labels);
+      } catch (const std::exception& e) {
+        // Parsing error yields an empty MSA and score
+        int index = i * checked_size_to_int(extend_penalties.size(),
+                                            "extend_penalties.size()") +
+                    j;
+        results[index] = {LLONG_MIN, p.gap_open, p.gap_extend};
+        continue;
+      }
+      // Seed leaf profiles using raw sequences; internal labels correspond to sequence indices
       std::queue<Node*> q;
       if (root) q.push(root);
       while (!q.empty()) {
         Node* u = q.front();
         q.pop();
         if (!u) continue;
-        if (u->leaf)
-          u->profile = {initial_seqs[u->seq_index]};
-        else {
+        if (u->leaf) {
+          int idx = u->seq_index;
+          if (idx < 0 || idx >= checked_size_to_int(initial_seqs.size(),
+                                                    "initial_seqs.size()")) {
+            free_tree(root);
+            throw std::runtime_error("Invalid leaf sequence index " +
+                                     std::to_string(idx));
+          }
+          u->profile = {initial_seqs[idx]};
+        } else {
           if (u->left) q.push(u->left);
           if (u->right) q.push(u->right);
         }
       }
-
-      auto msa = build_profile(root, mode, fn, p);
-      free_tree(root);  // Clean up the tree to prevent memory leaks
-      long long sc    = calculate_sp_score(msa, mode, fn, p);
-      int       index = i * checked_size_to_int(extend_penalties.size(),
-                                                "extend_penalties.size()") +
+      auto msa = build_profile(root, initial_seqs, mode, fn, p);
+      free_tree(root);
+      long long sc = calculate_sp_score(msa, mode, fn, p);
+      int index = i * checked_size_to_int(extend_penalties.size(),
+                                          "extend_penalties.size()") +
                   j;
       results[index] = {sc, p.gap_open, p.gap_extend};
     }
@@ -2778,30 +3044,21 @@ int main(int argc, char** argv) {
     files.emplace_back(argv[argi]);
   }
 
-  // 4) Read and Finalize Headers
+  // 4) Read sequences and build canonical headers
   const int n = checked_size_to_int(files.size(), "files.size()");
   std::vector<std::string> hdrs(n), seqs(n);
   for (int i = 0; i < n; ++i) {
-    processFasta(files[i], hdrs[i], seqs[i]);
-
-    // First, sanitize all whitespace to underscores
-    sanitize_header(hdrs[i]);
-
-    // Second, simplify the header to its final form
-    if (mode == MODE_PROTEIN) {
-      auto&  h  = hdrs[i];
-      size_t p1 = h.find('|');
-      size_t p2 =
-          (p1 == std::string::npos ? std::string::npos : h.find('|', p1 + 1));
-      if (p1 != std::string::npos && p2 != std::string::npos)
-        hdrs[i] = h.substr(p1 + 1, p2 - p1 - 1);
-    } else {  // DNA mode
-      auto& h = hdrs[i];
-      // Since spaces are now underscores, we simplify by taking the part before
-      // the first underscore.
-      size_t sp = h.find('_');
-      if (sp != std::string::npos) {
-        hdrs[i] = h.substr(0, sp);
+    std::string raw_hdr;
+    processFasta(files[i], raw_hdr, seqs[i]);
+    // Generate a canonical label for each header
+    hdrs[i] = canonicalize_fasta_header(raw_hdr, mode);
+  }
+  // Ensure that all canonical headers are unique
+  {
+    std::unordered_set<std::string> seen;
+    for (const auto& h : hdrs) {
+      if (!seen.insert(h).second) {
+        throw std::runtime_error("Duplicate canonical header detected: " + h);
       }
     }
   }
@@ -2820,47 +3077,57 @@ int main(int argc, char** argv) {
               << std::endl;
   }
 
-  auto D = computeDistanceMatrix(seqs, mode, fn, params);
+  try {
+    auto D = computeDistanceMatrix(seqs, mode, fn, params);
 
-  // Save the identity matrix to a file
-  saveIdentityMatrix(D, hdrs, outdir);
-  auto nwk = buildUPGMATree(D, hdrs);
+    // Save the identity matrix to a file
+    saveIdentityMatrix(D, hdrs, outdir);
+    // Generate stable internal labels for the guide tree
+    std::vector<std::string> internal_labels =
+        make_internal_tree_labels(hdrs.size());
+    auto nwk = buildUPGMATree(D, internal_labels);
 
-  // Format the Newick string for readability before saving
-  std::string nwk_formatted = formatNewickString(nwk);
+    // Format the Newick string for readability before saving
+    std::string nwk_formatted = formatNewickString(nwk);
 
-  std::ofstream tf(outdir + "/guide_tree.nwk");
-  tf << nwk_formatted;  // The formatted string already contains newlines
-  tf.close();
-  // ?? 7) Build pairwise library once (shared by all three methods) ????????
-  // std::cout << "\nBuilding pairwise library for LE scoring..." << std::endl;
-  auto pl = buildPairLib(seqs, mode, fn, params);
-  // std::cout << "Pairwise library built.\n" << std::endl;
+    std::ofstream tf(outdir + "/guide_tree.nwk");
+    tf << nwk_formatted;  // The formatted string already contains newlines
+    tf.close();
+    // ?? 7) Build pairwise library once (shared by all three methods) ????????
+    auto pl = buildPairLib(seqs, mode, fn, params);
 
-  // ?? 8) Helper: parse tree + seed leaves (reused three times) ????????????
-  auto make_tree = [&]() -> Node* {
-    Node*             root = parseNewick(nwk, hdrs);
-    std::queue<Node*> q;
-    if (root) q.push(root);
-    while (!q.empty()) {
-      Node* u = q.front();
-      q.pop();
-      if (!u) continue;
-      if (u->leaf) {
-        if (u->seq_index < 0 ||
-            u->seq_index >= checked_size_to_int(seqs.size(), "seqs.size()")) {
-          std::cerr << "\nFATAL LOGIC ERROR: Invalid seq_index " << u->seq_index
-                    << std::endl;
-          return nullptr;
-        }
-        u->profile = {seqs[u->seq_index]};
-      } else {
-        if (u->left) q.push(u->left);
-        if (u->right) q.push(u->right);
+    // ?? 8) Helper: parse tree + seed leaves (reused three times) ????????????
+    auto make_tree = [&]() -> Node* {
+      Node* root = nullptr;
+      try {
+        root = parseNewick(nwk, internal_labels);
+      } catch (const std::exception& e) {
+        std::cerr << "Error parsing guide tree: " << e.what() << "\n";
+        return nullptr;
       }
-    }
-    return root;
-  };
+      std::queue<Node*> q;
+      if (root) q.push(root);
+      while (!q.empty()) {
+        Node* u = q.front();
+        q.pop();
+        if (!u) continue;
+        if (u->leaf) {
+          int idx = u->seq_index;
+          if (idx < 0 ||
+              idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
+            std::cerr << "\nFATAL LOGIC ERROR: Invalid seq_index " << idx
+                      << std::endl;
+            free_tree(root);
+            return nullptr;
+          }
+          u->profile = {seqs[idx]};
+        } else {
+          if (u->left) q.push(u->left);
+          if (u->right) q.push(u->right);
+        }
+      }
+      return root;
+    };
 
   // ?? 9) Run all three aligners in parallel ???????????????????????????????
   std::vector<std::string> msa_nw, msa_fft, msa_le;
@@ -2877,7 +3144,7 @@ int main(int argc, char** argv) {
     {
       Node* root_nw = make_tree();
       if (root_nw) {
-        msa_nw   = build_profile(root_nw, mode, fn, params);
+        msa_nw   = build_profile(root_nw, seqs, mode, fn, params);
         score_nw = calculate_sp_score(msa_nw, mode, fn, params);
         free_tree(root_nw);
       }
@@ -2889,7 +3156,7 @@ int main(int argc, char** argv) {
     {
       Node* root_fft = make_tree();
       if (root_fft) {
-        msa_fft   = build_profile_fft(root_fft, mode, fn, params);
+        msa_fft   = build_profile_fft(root_fft, seqs, mode, fn, params);
         score_fft = calculate_sp_score(msa_fft, mode, fn, params);
         free_tree(root_fft);
       }
@@ -2929,37 +3196,36 @@ int main(int argc, char** argv) {
   //           << " (score: " << std::max({score_nw, score_fft, score_le})
   //           << ")\n" << std::endl;
 
-  // ?? 11) Iterative refinement on the winner ???????????????????????????????
-  int total_rounds                    = 3;
-  int iterations_per_thread_per_round = 10;
-  msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn,
-                   params);
-
+  // 11) Refinement
+  msa = refine_msa(msa, 3, 10, mode, fn, params);
   normalize_msa_lengths(msa);
 
-  if (msa.size() != hdrs.size()) {
-    std::cerr << "FATAL: final MSA row count (" << msa.size()
-              << ") != header count (" << hdrs.size() << ")\n";
+  // Verify row count
+  try {
+    validate_msa_shape(msa, hdrs.size());
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << "\n";
     return 1;
   }
 
-  // ?? 12) Print and save colored MSA ??????????????????????????????????????
+  // 12) Output
   printColorMSA(msa);
   saveMSA_to_HTML(msa, hdrs, outdir);
 
-  // ?? 13) Analyze and save consensus ??????????????????????????????????????
-  std::string   final_consensus = generate_consensus(msa);
+  std::string final_consensus = generate_consensus(msa);
   std::ofstream cf(outdir + "/consensus.fasta");
   cf << ">consensus\n" << final_consensus << "\n";
   cf.close();
   analyze_and_save_consensus(msa, hdrs, final_consensus, outdir);
 
-  // ?? 14) Write MSA in FASTA format ???????????????????????????????????????
-  std::ofstream mf(outdir + "/msa.fasta");
-  for (size_t i = 0; i < msa.size(); ++i) {
-    mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
+    std::ofstream mf(outdir + "/msa.fasta");
+    for (size_t i = 0; i < msa.size(); ++i) {
+      mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
+    }
+    mf.close();
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << "\n";
+    return 1;
   }
-  mf.close();
-
   return 0;
 }
