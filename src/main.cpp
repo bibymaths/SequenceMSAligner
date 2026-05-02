@@ -45,6 +45,15 @@
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
+#include <map>
+#include <chrono>
+#include <random>
+#include <ctime>
+#include <iomanip>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <omp.h>
+#include <cstdlib>
 
 #include "EBLOSUM62.h"
 #include "EDNAFULL.h"
@@ -1528,14 +1537,21 @@ std::vector<std::vector<double>> computeDistanceMatrix(
     for (int j = i + 1; j < static_cast<int>(n); ++j) {
       std::string ax, ay;
       computeGlobalAlignment(seqs[i], seqs[j], mode, fn, ax, ay, p);
-      const int L     = checked_size_to_int(ax.size(), "ax.size()");
-      int       match = 0;
-      // count matches
+      const int L = checked_size_to_int(ax.size(), "ax.size()");
+      int       matches = 0;
+      int       compared = 0;
       for (int k = 0; k < L; ++k) {
-        if (ax[k] == ay[k] && ax[k] != '-') ++match;
+        char ca = ax[k];
+        char cb = ay[k];
+        if (ca == '-' && cb == '-') continue;  // skip double-gap columns
+        if (ca != '-' && cb != '-' && ca == cb) {
+          ++matches;
+        }
+        ++compared;
       }
-      double identity = (L > 0 ? double(match) / L : 0.0);
-      double dist     = 1.0 - identity;
+      double identity = 0.0;
+      if (compared > 0) identity = static_cast<double>(matches) / compared;
+      double dist = 1.0 - identity;
       D[i][j] = D[j][i] = dist;
     }
   }
@@ -2019,6 +2035,327 @@ void saveIdentityMatrix(const std::vector<std::vector<double>>& D,
 }
 
 /**
+ * @brief Generate a unique job identifier of the form
+ *        msalign-IYYYYMMDD-HHMMSS-RAND4-RAND8-p1m
+ *
+ * The timestamp is taken from the current system clock and formatted
+ * according to UTC. Random numeric components are generated using
+ * a mt19937 PRNG seeded with std::random_device.
+ *
+ * @return A string conforming to the required job ID specification.
+ */
+static std::string generate_job_id() {
+  auto now      = std::chrono::system_clock::now();
+  auto now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  gmtime_s(&tm, &now_time);
+#else
+  gmtime_r(&now_time, &tm);
+#endif
+  std::ostringstream oss;
+  oss << "msalign-I";
+  oss << std::put_time(&tm, "%Y%m%d-%H%M%S");
+  std::random_device rd;
+  std::mt19937       gen(rd());
+  std::uniform_int_distribution<int> dist4(0, 9999);
+  std::uniform_int_distribution<int> dist8(0, 99999999);
+  int r4 = dist4(gen);
+  int r8 = dist8(gen);
+  oss << "-" << std::setw(4) << std::setfill('0') << r4;
+  oss << "-" << std::setw(8) << std::setfill('0') << r8;
+  oss << "-p1m";
+  return oss.str();
+}
+
+/**
+ * @brief Compute a percent identity matrix from a multiple sequence alignment.
+ *
+ * The identity between two sequences i and j is defined as the ratio of
+ * identical residues to the number of positions compared, where positions
+ * where both sequences have a gap are excluded. If no positions are
+ * comparable, the identity is defined as 0.0. The diagonal entries are 1.0.
+ *
+ * @param msa Aligned sequences of equal length.
+ * @return A symmetric matrix of size N×N with values in [0,1].
+ */
+static std::vector<std::vector<double>>
+compute_percent_identity_from_msa(const std::vector<std::string>& msa) {
+  const std::size_t n = msa.size();
+  std::vector<std::vector<double>> pim(n, std::vector<double>(n, 1.0));
+  if (n == 0) return pim;
+  const std::size_t L = msa[0].size();
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = i + 1; j < n; ++j) {
+      std::size_t matches      = 0;
+      std::size_t compared_pos = 0;
+      for (std::size_t col = 0; col < L; ++col) {
+        char a = msa[i][col];
+        char b = msa[j][col];
+        if (a == '-' && b == '-') continue;
+        if (a == b && a != '-') ++matches;
+        ++compared_pos;
+      }
+      double identity = 0.0;
+      if (compared_pos > 0) identity = static_cast<double>(matches) / compared_pos;
+      pim[i][j] = pim[j][i] = identity;
+    }
+  }
+  return pim;
+}
+
+/**
+ * @brief Write a percent identity matrix to a file using a format similar to
+ * Clustal Omega.
+ *
+ * The matrix is prefaced by comment lines and then a table containing
+ * indices, names and identity percentages. Values on the diagonal are
+ * shown as 100.00. Off-diagonal values are scaled by 100.
+ *
+ * @param pim Matrix of identity fractions.
+ * @param names Sequence identifiers corresponding to the rows/columns.
+ * @param outpath Path to write the identity matrix file.
+ */
+static void write_percent_identity_matrix(const std::vector<std::vector<double>>& pim,
+                                          const std::vector<std::string>& names,
+                                          const std::string& outpath) {
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Error writing percent identity matrix to " << outpath << std::endl;
+    return;
+  }
+  out << "#\n#\n#  Percent Identity Matrix\n#\n#\n\n";
+  const std::size_t n = names.size();
+  std::size_t max_len = 0;
+  for (const auto& nm : names) {
+    if (nm.size() > max_len) max_len = nm.size();
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    out << std::setw(6) << std::right << (i + 1) << ": "
+        << std::setw(static_cast<int>(max_len) + 2) << std::left << names[i];
+    for (std::size_t j = 0; j < n; ++j) {
+      double val = (i == j ? 1.0 : pim[i][j]);
+      out << std::setw(8) << std::right << std::fixed << std::setprecision(2)
+          << (val * 100.0);
+    }
+    out << "\n";
+  }
+  out.close();
+}
+
+/**
+ * @brief Write a multiple sequence alignment in CLUSTAL format with residue numbering.
+ *
+ * Sequence names are left-aligned to a uniform width. The alignment is printed
+ * in blocks of a fixed column width. At the end of each sequence line, the
+ * number of non-gap residues up to and including the last character of that
+ * block is displayed. A consensus line is generated showing '*' for fully
+ * conserved positions across all sequences and ' ' otherwise.
+ *
+ * @param msa Aligned sequences of equal length.
+ * @param names Sequence identifiers corresponding to the rows.
+ * @param outpath Path to write the CLUSTAL formatted alignment.
+ * @param block_size Width of each alignment block (default 60).
+ */
+static void write_clustal_alignment(const std::vector<std::string>& msa,
+                                    const std::vector<std::string>& names,
+                                    const std::string& outpath,
+                                    std::size_t block_size = 60) {
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Error writing CLUSTAL alignment to " << outpath << std::endl;
+    return;
+  }
+  out << "MSAlign multiple sequence alignment with numbers\n\n";
+  const std::size_t n = msa.size();
+  if (n == 0) {
+    out.close();
+    return;
+  }
+  const std::size_t L = msa[0].size();
+  std::size_t name_width = 0;
+  for (const auto& nm : names) {
+    if (nm.size() > name_width) name_width = nm.size();
+  }
+  name_width += 2;
+  std::vector<std::size_t> residue_counts(n, 0);
+  for (std::size_t start = 0; start < L; start += block_size) {
+    std::size_t end = std::min(start + block_size, L);
+    for (std::size_t i = 0; i < n; ++i) {
+      out << std::setw(static_cast<int>(name_width)) << std::left << names[i];
+      for (std::size_t col = start; col < end; ++col) {
+        out << msa[i][col];
+      }
+      std::size_t count = 0;
+      for (std::size_t col = start; col < end; ++col) {
+        if (msa[i][col] != '-') ++count;
+      }
+      residue_counts[i] += count;
+      out << ' ' << std::setw(6) << residue_counts[i] << '\n';
+    }
+    out << std::setw(static_cast<int>(name_width)) << std::left << "";
+    for (std::size_t col = start; col < end; ++col) {
+      char c = msa[0][col];
+      bool conserved = (c != '-');
+      for (std::size_t i = 1; i < n && conserved; ++i) {
+        if (msa[i][col] != c) conserved = false;
+      }
+      out << (conserved ? '*' : ' ');
+    }
+    out << "\n\n";
+  }
+  out.close();
+}
+
+/**
+ * @brief Write a multiple sequence alignment in FASTA format.
+ *
+ * @param msa Aligned sequences of equal length.
+ * @param names Sequence identifiers corresponding to the rows.
+ * @param outpath Path to write the FASTA formatted alignment.
+ */
+static void write_fasta_alignment(const std::vector<std::string>& msa,
+                                  const std::vector<std::string>& names,
+                                  const std::string& outpath) {
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Error writing FASTA alignment to " << outpath << std::endl;
+    return;
+  }
+  const std::size_t wrap_width = 80;
+  for (std::size_t i = 0; i < msa.size(); ++i) {
+    out << '>' << names[i] << '\n';
+    const std::string& seq = msa[i];
+    for (std::size_t pos = 0; pos < seq.size(); pos += wrap_width) {
+      out << seq.substr(pos, std::min(wrap_width, seq.size() - pos)) << '\n';
+    }
+  }
+  out.close();
+}
+
+/**
+ * @brief Write metadata about the run to a JSON file.
+ */
+static void write_metadata_json(const std::string& outpath, const std::string& job_id,
+                                const std::string& tool_name, const std::string& tool_version,
+                                const std::string& start_time, const std::string& end_time,
+                                double duration_seconds, const std::string& cmdline,
+                                const std::string& input_file, const std::string& sequence_type,
+                                const std::vector<std::string>& names, int num_threads,
+                                bool avx2_enabled, bool openmp_enabled,
+                                const std::string& distance_model,
+                                const std::string& guide_tree_alg,
+                                const std::string& progressive_alg,
+                                const std::string& refinement_method,
+                                const std::string& best_method,
+                                const std::map<std::string,std::string>& outputs) {
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Error writing metadata JSON to " << outpath << std::endl;
+    return;
+  }
+  out << "{\n";
+  out << "  \"job_id\": \"" << job_id << "\",\n";
+  out << "  \"tool_name\": \"" << tool_name << "\",\n";
+  out << "  \"tool_version\": \"" << tool_version << "\",\n";
+  out << "  \"run_started_at\": \"" << start_time << "\",\n";
+  out << "  \"run_finished_at\": \"" << end_time << "\",\n";
+  out << std::fixed << std::setprecision(3);
+  out << "  \"duration_seconds\": " << duration_seconds << ",\n";
+  out << "  \"command_line\": \"" << cmdline << "\",\n";
+  out << "  \"input_file\": \"" << input_file << "\",\n";
+  out << "  \"sequence_type\": \"" << sequence_type << "\",\n";
+  out << "  \"num_sequences\": " << names.size() << ",\n";
+  out << "  \"sequence_ids\": [";
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    out << "\"" << names[i] << "\"";
+    if (i + 1 < names.size()) out << ", ";
+  }
+  out << "],\n";
+  out << "  \"num_threads\": " << num_threads << ",\n";
+  out << "  \"simd\": {\n";
+  out << "    \"avx2_enabled\": " << (avx2_enabled ? "true" : "false") << ",\n";
+  out << "    \"runtime_detected\": " << (avx2_enabled ? "true" : "false") << "\n";
+  out << "  },\n";
+  out << "  \"openmp_enabled\": " << (openmp_enabled ? "true" : "false") << ",\n";
+  out << "  \"algorithm\": {\n";
+  out << "    \"distance_model\": \"" << distance_model << "\",\n";
+  out << "    \"guide_tree\": \"" << guide_tree_alg << "\",\n";
+  out << "    \"progressive_alignment\": \"" << progressive_alg << "\",\n";
+  out << "    \"profile_profile_alignment\": \"" << best_method << "\",\n";
+  out << "    \"refinement\": \"" << refinement_method << "\"\n";
+  out << "  },\n";
+  out << "  \"outputs\": {\n";
+  std::size_t counter = 0;
+  for (const auto& kv : outputs) {
+    out << "    \"" << kv.first << "\": \"" << kv.second << "\"";
+    if (++counter < outputs.size()) out << ",\n";
+    else out << "\n";
+  }
+  out << "  },\n";
+  out << "  \"status\": \"success\",\n";
+  out << "  \"warnings\": [],\n";
+  out << "  \"errors\": []\n";
+  out << "}\n";
+  out.close();
+}
+
+/**
+ * @brief Write a submission XML file describing the run.
+ */
+static void write_submission_xml(const std::string& outpath, const std::string& job_id,
+                                 const std::string& cmdline,
+                                 const std::vector<std::string>& names,
+                                 const std::map<std::string,std::string>& outputs,
+                                 const std::string& sequence_type) {
+  auto xml_escape = [](const std::string& s) -> std::string {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+      switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default: out.push_back(c); break;
+      }
+    }
+    return out;
+  };
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Error writing submission XML to " << outpath << std::endl;
+    return;
+  }
+  out << "<execution>\n";
+  out << "  <commandLine>" << xml_escape(cmdline) << "</commandLine>\n";
+  out << "  <userParameters class=\"linked-hash-map\">\n";
+  out << "    <entry><string>program</string><string>msalign-compatible-tool</string></entry>\n";
+  out << "    <entry><string>version</string><string>1.0</string></entry>\n";
+  out << "    <entry><string>guidetreeout</string><boolean>true</boolean></entry>\n";
+  out << "    <entry><string>dismatout</string><boolean>true</boolean></entry>\n";
+  out << "    <entry><string>dealign</string><boolean>false</boolean></entry>\n";
+  out << "    <entry><string>mbed</string><boolean>true</boolean></entry>\n";
+  out << "    <entry><string>mbediteration</string><boolean>true</boolean></entry>\n";
+  out << "    <entry><string>iterations</string><int>3</int></entry>\n";
+  out << "    <entry><string>outfmt</string><string>clustal_num</string></entry>\n";
+  out << "    <entry><string>order</string><string>aligned</string></entry>\n";
+  out << "    <entry><string>stype</string><string>" << xml_escape(sequence_type) << "</string></entry>\n";
+  out << "    <entry><string>sequence</string><string>" << xml_escape(outputs.at("sequence")) << "</string></entry>\n";
+  out << "  </userParameters>\n";
+  out << "  <outputLocation>file:" << xml_escape(outputs.at("zip")) << "</outputLocation>\n";
+  out << "  <errorLocation>file:" << xml_escape(outputs.at("zip")) << "</errorLocation>\n";
+  out << "  <toolId>msalign-compatible-tool</toolId>\n";
+  out << "  <jobId>" << xml_escape(job_id) << "</jobId>\n";
+  out << "  <jobTitle></jobTitle>\n";
+  out << "  <emailNotification>false</emailNotification>\n";
+  out << "  <executionContext>local</executionContext>\n";
+  out << "</execution>\n";
+  out.close();
+}
+
+/**
  * @brief Build a UPGMA guide tree via a min-heap in O(n^2 log n).
  *
  * This function performs agglomerative clustering under the UPGMA
@@ -2240,7 +2577,7 @@ std::vector<std::string> refine_msa(std::vector<std::string> initial_msa,
     }
   }
 
-  std::cout << "\nMSA Score: " << global_best_score << "\n\n" << std::endl;
+  // std::cout << "\nMSA Score: " << global_best_score << "\n\n" << std::endl;
   return global_best_msa;
 }
 
@@ -2782,96 +3119,197 @@ struct GapSearchResult {
  */
 GapSearchResult find_optimal_gap_penalties(
     const std::vector<std::string>& initial_seqs,
-    const std::vector<std::string>& initial_hdrs, ScoreMode mode, ScoreFn fn) {
-  std::cout << "\n--- Starting search for optimal gap penalties ---"
-            << std::endl;
+    const std::vector<std::string>& initial_hdrs,
+    ScoreMode mode,
+    ScoreFn fn) {
 
-  // 1. Define the grid of parameters to search
+  // std::cout << "\n--- Starting search for optimal gap penalties ---"
+  //           << std::endl;
+
   std::vector<double> open_penalties;
-  for (int oi = 0; oi <= 6; ++oi) {
-    double o = -25.0 + 2.5 * oi;
-    open_penalties.push_back(o);  // e.g., -25, -22.5, ... -10
-  }
-
   std::vector<double> extend_penalties;
-  for (int ei = 0; ei <= 4; ++ei) {
-    double e = -5.0 + static_cast<double>(ei);
-    extend_penalties.push_back(e);  // e.g., -5, -4, -3, -2, -1
+
+  /*
+   * Protein and DNA/RNA use the same affine-gap principle:
+   * gap opening must be substantially more expensive than gap extension.
+   *
+   * Because penalties are negative, "larger penalty" means larger absolute value.
+   *
+   * Example:
+   *   gap_open   = -14.0
+   *   gap_extend = -1.0
+   *
+   * This is valid because:
+   *   |gap_open| > |gap_extend|
+   */
+
+  if (mode == MODE_PROTEIN) {
+    /*
+     * Protein alignments usually tolerate a broader gap-open search space.
+     * BLOSUM62-based scoring often benefits from stronger opening penalties.
+     */
+    for (double o = -30.0; o <= -6.0; o += 2.0) {
+      open_penalties.push_back(o);
+    }
+
+    for (double e = -5.0; e <= -0.25; e += 0.25) {
+      extend_penalties.push_back(e);
+    }
+
+  } else {
+    /*
+     * DNA/RNA alignments generally need a slightly narrower gap-extension range.
+     * Very high extension penalties can fragment nucleotide alignments badly.
+     */
+    for (double o = -25.0; o <= -5.0; o += 2.0) {
+      open_penalties.push_back(o);
+    }
+
+    for (double e = -4.0; e <= -0.25; e += 0.25) {
+      extend_penalties.push_back(e);
+    }
   }
 
   std::vector<GapSearchResult> results(open_penalties.size() *
                                        extend_penalties.size());
 
-// 2. Perform the grid search in parallel
 #pragma omp parallel for collapse(2) schedule(dynamic) default(none) \
     shared(open_penalties, extend_penalties, results, initial_seqs,  \
-               initial_hdrs, mode, fn)
+           initial_hdrs, mode, fn)
   for (int i = 0;
-       i < checked_size_to_int(open_penalties.size(), "open_penalties.size()");
+       i < checked_size_to_int(open_penalties.size(),
+                               "open_penalties.size()");
        ++i) {
-    for (int j = 0; j < checked_size_to_int(extend_penalties.size(),
-                                            "extend_penalties.size()");
+
+    for (int j = 0;
+         j < checked_size_to_int(extend_penalties.size(),
+                                 "extend_penalties.size()");
          ++j) {
-      AlignParams p;  // stack-allocated, thread-private
+
+      AlignParams p;
       p.gap_open   = open_penalties[i];
       p.gap_extend = extend_penalties[j];
 
+      const int index =
+          i * checked_size_to_int(extend_penalties.size(),
+                                  "extend_penalties.size()") +
+          j;
+
+      /*
+       * Biological affine-gap sanity constraint.
+       *
+       * Opening a new gap should be substantially more expensive than
+       * extending an existing gap.
+       *
+       * Because both values are negative:
+       *
+       *   std::abs(gap_open) >= 3.0 * std::abs(gap_extend)
+       *
+       * means:
+       *
+       *   -12.0 / -1.0 is valid
+       *   -6.0  / -5.0 is rejected
+       */
+      if (std::abs(p.gap_open) < 3.0 * std::abs(p.gap_extend)) {
+        results[index] = {LLONG_MIN, p.gap_open, p.gap_extend};
+        continue;
+      }
+
       auto D = computeDistanceMatrix(initial_seqs, mode, fn, p);
-      // Build guide tree using stable internal labels
+
+      /*
+       * Use stable internal labels during temporary grid-search tree parsing.
+       * This avoids Newick parsing problems if biological IDs contain
+       * punctuation. The final production guide tree can still use preserved
+       * sequence identifiers.
+       */
       std::vector<std::string> internal_labels =
           make_internal_tree_labels(initial_hdrs.size());
+
       auto nwk = buildUPGMATree(D, internal_labels);
+
       Node* root = nullptr;
       try {
         root = parseNewick(nwk, internal_labels);
       } catch (const std::exception& e) {
-        // Parsing error yields an empty MSA and score
-        int index = i * checked_size_to_int(extend_penalties.size(),
-                                            "extend_penalties.size()") +
-                    j;
         results[index] = {LLONG_MIN, p.gap_open, p.gap_extend};
         continue;
       }
-      // Seed leaf profiles using raw sequences; internal labels correspond to sequence indices
+
       std::queue<Node*> q;
-      if (root) q.push(root);
+      if (root) {
+        q.push(root);
+      }
+
       while (!q.empty()) {
         Node* u = q.front();
         q.pop();
-        if (!u) continue;
+
+        if (!u) {
+          continue;
+        }
+
         if (u->leaf) {
           int idx = u->seq_index;
-          if (idx < 0 || idx >= checked_size_to_int(initial_seqs.size(),
-                                                    "initial_seqs.size()")) {
+
+          if (idx < 0 ||
+              idx >= checked_size_to_int(initial_seqs.size(),
+                                         "initial_seqs.size()")) {
             free_tree(root);
-            throw std::runtime_error("Invalid leaf sequence index " +
-                                     std::to_string(idx));
+            results[index] = {LLONG_MIN, p.gap_open, p.gap_extend};
+            root = nullptr;
+            break;
           }
+
           u->profile = {initial_seqs[idx]};
+
         } else {
-          if (u->left) q.push(u->left);
-          if (u->right) q.push(u->right);
+          if (u->left) {
+            q.push(u->left);
+          }
+
+          if (u->right) {
+            q.push(u->right);
+          }
         }
       }
+
+      if (!root) {
+        continue;
+      }
+
       auto msa = build_profile(root, initial_seqs, mode, fn, p);
       free_tree(root);
+
+      normalize_msa_lengths(msa);
+
       long long sc = calculate_sp_score(msa, mode, fn, p);
-      int index = i * checked_size_to_int(extend_penalties.size(),
-                                          "extend_penalties.size()") +
-                  j;
+
       results[index] = {sc, p.gap_open, p.gap_extend};
     }
   }
 
-  // 4. Find the best result from all the parallel tasks
   GapSearchResult best_result;
+  best_result.score = LLONG_MIN;
+
   for (const auto& result : results) {
     if (result.score > best_result.score) {
       best_result = result;
     }
   }
 
-  // std::cout << "\n--- Finished parameter search ---" << std::endl;
+  if (best_result.score == LLONG_MIN) {
+    throw std::runtime_error(
+        "Gap-penalty grid search failed: no valid gap-open/gap-extend "
+        "combination passed the affine-gap sanity constraints.");
+  }
+
+  // std::cout << "--- Finished gap penalty search ---\n"
+  //           << "Best GAP_OPEN=" << best_result.gap_open
+  //           << ", GAP_EXTEND=" << best_result.gap_extend
+  //           << ", score=" << best_result.score
+  //           << std::endl;
+
   return best_result;
 }
 
@@ -3026,6 +3464,9 @@ int main(int argc, char** argv) {
     }
   }
 
+  // capture run start time for metadata
+  auto run_start_point = std::chrono::system_clock::now();
+
   // 2) Next arg is outdir
   if (argi >= argc) {
     std::cerr << "Error: missing outdir.\n";
@@ -3069,7 +3510,7 @@ int main(int argc, char** argv) {
     if (!user_gap_extend) params.gap_extend = best.gap_extend;
     std::cout << "\nOptimal parameters found: GAP_OPEN=" << params.gap_open
               << ", GAP_EXTEND=" << params.gap_extend
-              << " with score: " << best.score << "\n"
+              // << " with score: " << best.score << "\n"
               << std::endl;
   } else {
     std::cout << "\nGAP_OPEN=" << params.gap_open
@@ -3078,29 +3519,20 @@ int main(int argc, char** argv) {
   }
 
   try {
+    // Compute pairwise distance matrix from global alignments
     auto D = computeDistanceMatrix(seqs, mode, fn, params);
 
-    // Save the identity matrix to a file
-    saveIdentityMatrix(D, hdrs, outdir);
-    // Generate stable internal labels for the guide tree
-    std::vector<std::string> internal_labels =
-        make_internal_tree_labels(hdrs.size());
-    auto nwk = buildUPGMATree(D, internal_labels);
+    // Build guide tree using canonical sequence identifiers
+    auto nwk = buildUPGMATree(D, hdrs);
 
-    // Format the Newick string for readability before saving
-    std::string nwk_formatted = formatNewickString(nwk);
-
-    std::ofstream tf(outdir + "/guide_tree.nwk");
-    tf << nwk_formatted;  // The formatted string already contains newlines
-    tf.close();
-    // ?? 7) Build pairwise library once (shared by all three methods) ????????
+    // Build pairwise residue library for LE-guided alignment
     auto pl = buildPairLib(seqs, mode, fn, params);
 
-    // ?? 8) Helper: parse tree + seed leaves (reused three times) ????????????
+    // Helper: parse tree with canonical names and seed leaf profiles
     auto make_tree = [&]() -> Node* {
       Node* root = nullptr;
       try {
-        root = parseNewick(nwk, internal_labels);
+        root = parseNewick(nwk, hdrs);
       } catch (const std::exception& e) {
         std::cerr << "Error parsing guide tree: " << e.what() << "\n";
         return nullptr;
@@ -3113,8 +3545,7 @@ int main(int argc, char** argv) {
         if (!u) continue;
         if (u->leaf) {
           int idx = u->seq_index;
-          if (idx < 0 ||
-              idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
+          if (idx < 0 || idx >= checked_size_to_int(seqs.size(), "seqs.size()")) {
             std::cerr << "\nFATAL LOGIC ERROR: Invalid seq_index " << idx
                       << std::endl;
             free_tree(root);
@@ -3129,100 +3560,197 @@ int main(int argc, char** argv) {
       return root;
     };
 
-  // ?? 9) Run all three aligners in parallel ???????????????????????????????
-  std::vector<std::string> msa_nw, msa_fft, msa_le;
-  long long                score_nw  = LLONG_MIN;
-  long long                score_fft = LLONG_MIN;
-  long long                score_le  = LLONG_MIN;
+    // Run the three progressive alignment strategies in parallel
+    std::vector<std::string> msa_nw, msa_fft, msa_le;
+    long long score_nw = LLONG_MIN;
+    long long score_fft = LLONG_MIN;
+    long long score_le = LLONG_MIN;
 
-#pragma omp parallel sections default(none)                                   \
+#pragma omp parallel sections default(none) \
     shared(make_tree, msa_nw, msa_fft, msa_le, score_nw, score_fft, score_le, \
-               mode, fn, params, seqs, pl)
-  {
-// ?? Section 1: Progressive NW (existing method) ?????????????????????
-#pragma omp section
+           mode, fn, params, seqs, pl)
     {
-      Node* root_nw = make_tree();
-      if (root_nw) {
-        msa_nw   = build_profile(root_nw, seqs, mode, fn, params);
-        score_nw = calculate_sp_score(msa_nw, mode, fn, params);
-        free_tree(root_nw);
+#pragma omp section
+      {
+        Node* root_nw = make_tree();
+        if (root_nw) {
+          msa_nw = build_profile(root_nw, seqs, mode, fn, params);
+          score_nw = calculate_sp_score(msa_nw, mode, fn, params);
+          free_tree(root_nw);
+        }
       }
-      // std::cout << "[NW]  SP score: " << score_nw << std::endl;
+#pragma omp section
+      {
+        Node* root_fft = make_tree();
+        if (root_fft) {
+          msa_fft = build_profile_fft(root_fft, seqs, mode, fn, params);
+          score_fft = calculate_sp_score(msa_fft, mode, fn, params);
+          free_tree(root_fft);
+        }
+      }
+#pragma omp section
+      {
+        Node* root_le = make_tree();
+        if (root_le) {
+          auto le_result = build_profile_le(root_le, seqs, pl, mode, fn, params);
+          msa_le = le_result.profile;
+          score_le = calculate_sp_score(msa_le, mode, fn, params);
+          free_tree(root_le);
+        }
+      }
     }
 
-// ?? Section 2: FFT-seeded banded alignment ???????????????????????????
-#pragma omp section
-    {
-      Node* root_fft = make_tree();
-      if (root_fft) {
-        msa_fft   = build_profile_fft(root_fft, seqs, mode, fn, params);
-        score_fft = calculate_sp_score(msa_fft, mode, fn, params);
-        free_tree(root_fft);
-      }
-      // std::cout << "[FFT] SP score: " << score_fft << std::endl;
-    }
-
-// ?? Section 3: COFFEE LE-guided alignment ????????????????????????????
-#pragma omp section
-    {
-      Node* root_le = make_tree();
-      if (root_le) {
-        auto le_result = build_profile_le(root_le, seqs, pl, mode, fn, params);
-        msa_le         = le_result.profile;
-        score_le       = calculate_sp_score(msa_le, mode, fn, params);
-        free_tree(root_le);
-      }
-      // std::cout << "[LE]  SP score: " << score_le << std::endl;
-    }
-  }
-
-  // ?? 10) Select best initial alignment ???????????????????????????????????
-  std::vector<std::string> msa;
-  std::string              best_method;
-
-  if (score_nw >= score_fft && score_nw >= score_le) {
-    msa         = std::move(msa_nw);
+    // Select best initial alignment
+    std::vector<std::string> msa;
+    std::string best_method;
+    long long best_score = score_nw;
+    msa = msa_nw;
     best_method = "Progressive NW";
-  } else if (score_fft >= score_nw && score_fft >= score_le) {
-    msa         = std::move(msa_fft);
-    best_method = "FFT-Seeded Banded";
-  } else {
-    msa         = std::move(msa_le);
-    best_method = "COFFEE LE-Guided";
-  }
-
-  // std::cout << "\n>>> Best initial alignment: " << best_method
-  //           << " (score: " << std::max({score_nw, score_fft, score_le})
-  //           << ")\n" << std::endl;
-
-  // 11) Refinement
-  msa = refine_msa(msa, 3, 10, mode, fn, params);
-  normalize_msa_lengths(msa);
-
-  // Verify row count
-  try {
-    validate_msa_shape(msa, hdrs.size());
-  } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << "\n";
-    return 1;
-  }
-
-  // 12) Output
-  printColorMSA(msa);
-  saveMSA_to_HTML(msa, hdrs, outdir);
-
-  std::string final_consensus = generate_consensus(msa);
-  std::ofstream cf(outdir + "/consensus.fasta");
-  cf << ">consensus\n" << final_consensus << "\n";
-  cf.close();
-  analyze_and_save_consensus(msa, hdrs, final_consensus, outdir);
-
-    std::ofstream mf(outdir + "/msa.fasta");
-    for (size_t i = 0; i < msa.size(); ++i) {
-      mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
+    if (score_fft >= best_score) {
+      best_score = score_fft;
+      msa = msa_fft;
+      best_method = "FFT-Seeded Banded";
     }
-    mf.close();
+    if (score_le >= best_score) {
+      best_score = score_le;
+      msa = msa_le;
+      best_method = "COFFEE LE-Guided";
+    }
+
+    // Refinement
+    msa = refine_msa(msa, 3, 10, mode, fn, params);
+    normalize_msa_lengths(msa);
+    // Validate shape
+    validate_msa_shape(msa, hdrs.size());
+
+    // Compute percent identity matrix from final MSA
+    auto pim = compute_percent_identity_from_msa(msa);
+
+    // Generate job identifier
+    std::string job_id = generate_job_id();
+
+    // Determine file paths with required naming scheme
+    std::string prefix = outdir + "/" + job_id;
+    std::map<std::string,std::string> outputs;
+    // Sequence file
+    std::string seq_file = prefix + ".sequence";
+    {
+      std::ofstream seq_out(seq_file);
+      if (!seq_out) {
+        throw std::runtime_error("Failed to write sequence file");
+      }
+      for (std::size_t i = 0; i < hdrs.size(); ++i) {
+        seq_out << ">" << hdrs[i] << "\n";
+        const std::string& s = seqs[i];
+        const std::size_t wrap_width = 80;
+        for (std::size_t pos = 0; pos < s.size(); pos += wrap_width) {
+          seq_out << s.substr(pos, std::min(wrap_width, s.size() - pos)) << "\n";
+        }
+      }
+      seq_out.close();
+    }
+    outputs["sequence"] = seq_file;
+    // CLUSTAL numbered alignment
+    std::string clustal_file = prefix + ".aln-clustal_num";
+    write_clustal_alignment(msa, hdrs, clustal_file);
+    outputs["clustal_num"] = clustal_file;
+    // FASTA aligned
+    std::string fasta_file = prefix + ".fa";
+    write_fasta_alignment(msa, hdrs, fasta_file);
+    outputs["fasta"] = fasta_file;
+    // Guide tree
+    std::string tree_file = prefix + ".phylotree";
+    {
+      std::ofstream tf(tree_file);
+      if (!tf) {
+        throw std::runtime_error("Failed to write guide tree file");
+      }
+      // Optionally format the Newick for readability
+      std::string formatted = formatNewickString(nwk);
+      tf << formatted;
+      tf.close();
+    }
+    outputs["guide_tree"] = tree_file;
+    // Percent identity matrix
+    std::string pim_file = prefix + ".pim";
+    write_percent_identity_matrix(pim, hdrs, pim_file);
+    outputs["percent_identity_matrix"] = pim_file;
+    // Metadata JSON
+    std::string metadata_file = prefix + ".metadata.json";
+    outputs["metadata"] = metadata_file;
+    // We'll fill after writing metadata
+    // Submission XML
+    std::string submission_file = prefix + ".submission";
+    outputs["submission"] = submission_file;
+    // Placeholder for zip path
+    std::string zip_file = prefix + ".zip";
+    outputs["zip"] = zip_file;
+
+    // Compose command line string
+    std::ostringstream cmdline_ss;
+    for (int idx = 0; idx < argc; ++idx) {
+      if (idx > 0) cmdline_ss << ' ';
+      cmdline_ss << argv[idx];
+    }
+    std::string cmdline = cmdline_ss.str();
+
+    // Determine sequence type string
+    std::string seq_type = (mode == MODE_PROTEIN ? "protein" : "dna");
+
+    // Record end time and compute duration
+    auto run_end_point = std::chrono::system_clock::now();
+    double duration_seconds = std::chrono::duration<double>(run_end_point - run_start_point).count();
+    // ISO format times
+    auto to_iso = [](std::chrono::system_clock::time_point tp) {
+      auto tt = std::chrono::system_clock::to_time_t(tp);
+      std::tm tm{};
+#ifdef _WIN32
+      gmtime_s(&tm, &tt);
+#else
+      gmtime_r(&tt, &tm);
+#endif
+      std::ostringstream oss;
+      oss << std::put_time(&tm, "%FT%TZ");
+      return oss.str();
+    };
+    std::string start_iso = to_iso(run_start_point);
+    std::string end_iso = to_iso(run_end_point);
+    // Determine number of threads
+    int num_threads = omp_get_max_threads();
+    bool avx2_enabled = true; // assume compiled with AVX2
+#ifdef __AVX2__
+    avx2_enabled = true;
+#else
+    avx2_enabled = false;
+#endif
+    bool openmp_enabled = true;
+#ifndef _OPENMP
+    openmp_enabled = false;
+#endif
+    // Write metadata JSON
+    write_metadata_json(metadata_file, job_id, "msalign-compatible-tool", "1.0", start_iso, end_iso,
+                        duration_seconds, cmdline, seq_file, seq_type, hdrs,
+                        num_threads, avx2_enabled, openmp_enabled,
+                        "global_alignment_identity", "UPGMA",
+                        best_method, "iterative_split_refinement", best_method, outputs);
+    // Write submission XML
+    write_submission_xml(submission_file, job_id, cmdline, hdrs, outputs, seq_type);
+    // Create zip archive containing outputs
+    {
+      std::ostringstream file_list;
+      file_list << " \"" << seq_file << "\"";
+      file_list << " \"" << clustal_file << "\"";
+      file_list << " \"" << fasta_file << "\"";
+      file_list << " \"" << tree_file << "\"";
+      file_list << " \"" << pim_file << "\"";
+      file_list << " \"" << metadata_file << "\"";
+      file_list << " \"" << submission_file << "\"";
+      std::string cmd = "zip -j -q \"" + zip_file + "\"" + file_list.str();
+      int rc = std::system(cmd.c_str());
+      if (rc != 0) {
+        std::cerr << "Warning: zip command returned non-zero exit code" << std::endl;
+      }
+    }
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";
     return 1;
