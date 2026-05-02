@@ -1002,17 +1002,16 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
   aligned_y.clear();
   int i = m, j = n;
   while (i > 0 || j > 0) {
-    char p = trace_buf[i * (n + 1) + j];
-    if (p == 'M') {
+    if (char path = trace_buf[i * (n + 1) + j]; path == 'M') {
       aligned_x.push_back(x[i - 1]);
       aligned_y.push_back(y[j - 1]);
       --i;
       --j;
-    } else if (p == 'F' || p == 'f') {
+    } else if (path == 'F' || path == 'f') {
       aligned_x.push_back(x[i - 1]);
       aligned_y.push_back('-');
       --i;
-    } else if (p == 'E' || p == 'e') {
+    } else if (path == 'E' || path == 'e') {
       aligned_x.push_back('-');
       aligned_y.push_back(y[j - 1]);
       --j;
@@ -1042,6 +1041,9 @@ int computeGlobalAlignment(const std::string& x, const std::string& y,
  * sequences contain a gap yield @c '-' in the consensus.
  *
  * @param profile  Vector of equally-length aligned sequence strings.
+ * For each alignment column, counts the frequency of each non-gap character
+ * across all sequences and selects the plurality character. Columns where all
+ * sequences contain a gap yield @c '-' in the consensus.
  * @return         Consensus string of the same length as the alignment columns.
  *                 Returns an empty string if @p profile is empty.
  */
@@ -1156,7 +1158,36 @@ long long calculate_sp_score(const std::vector<std::string>& msa,
 }
 
 /**
- * @brief Propagates newly introduced gap columns from an aligned representative
+ * @brief Normalizes the lengths of all sequences in a multiple sequence alignment
+ *        by padding shorter sequences with trailing gap characters.
+ *
+ * This function ensures that all sequences in the input vector @p msa have the
+ * same length by appending @c '-' characters to any sequence that is shorter
+ * than the longest sequence. The longest sequence length is determined by
+ * scanning through all sequences and finding the maximum length. Sequences
+ * that are already of maximum length are left unchanged.
+ *
+ * @param[in,out] msa Vector of aligned sequences to normalize. All sequences
+ *                     are modified in place to have the same length after
+ *                     this function returns. If @p msa is empty, no action is taken.
+ */
+void normalize_msa_lengths(std::vector<std::string>& msa) {
+  if (msa.empty()) return;
+
+  std::size_t max_len = 0;
+  for (const auto& row : msa) {
+    max_len = std::max(max_len, row.size());
+  }
+
+  for (auto& row : msa) {
+    if (row.size() < max_len) {
+      row.append(max_len - row.size(), '-');
+    }
+  }
+}
+
+/**
+ * @brief Propagates newly introduced gap columns from a aligned representative
  *        sequence into its entire profile.
  *
  * Compares @p oldc (the pre-alignment representative) against @p newc (the
@@ -1175,44 +1206,127 @@ void projectGaps(const std::string& oldc, const std::string& newc,
                  std::vector<std::string>& seqs) {
   if (seqs.empty()) return;
 
-  // Count how many gaps will be inserted to pre-validate
-  // newc must be >= oldc in length (only gaps added, never removed)
-  if (newc.size() < oldc.size()) return;  // corrupt alignment, bail out
+  if (newc.empty()) {
+    for (auto& s : seqs) {
+      s.clear();
+    }
+    return;
+  }
 
-  // Build a gap-insertion map: for each position in newc, is it a new gap?
-  std::vector<bool> is_new_gap(newc.size(), false);
-  size_t            old_idx = 0;
-  for (size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
-    if (old_idx < oldc.size() && newc[new_idx] == oldc[old_idx]) {
-      old_idx++;
+  std::vector<bool> insert_gap(newc.size(), false);
+  std::size_t       old_idx = 0;
+
+  for (std::size_t new_idx = 0; new_idx < newc.size(); ++new_idx) {
+    if (newc[new_idx] == '-') {
+      insert_gap[new_idx] = true;
     } else {
-      is_new_gap[new_idx] = true;
+      if (old_idx < oldc.size()) {
+        ++old_idx;
+      }
     }
   }
 
-  // Safety check: number of new gaps must not be absurdly large
-  size_t n_new_gaps = std::count(is_new_gap.begin(), is_new_gap.end(), true);
-  // Reject if more than 3x sequence length in gaps ? indicates corrupt FFT
-  // offset
-  if (n_new_gaps > seqs[0].size() * 3) return;
-
-  // Build each new sequence in one pass ? O(L) not O(L�)
   for (auto& s : seqs) {
     std::string result;
     result.reserve(newc.size());
-    size_t src = 0;
-    for (size_t i = 0; i < newc.size(); ++i) {
-      if (is_new_gap[i]) {
-        result += '-';
+
+    std::size_t src = 0;
+
+    for (std::size_t i = 0; i < newc.size(); ++i) {
+      if (insert_gap[i]) {
+        result.push_back('-');
       } else {
-        if (src < s.size())
-          result += s[src++];
-        else
-          result += '-';  // pad if source exhausted
+        if (src < s.size()) {
+          result.push_back(s[src]);
+          ++src;
+        } else {
+          result.push_back('-');
+        }
       }
     }
+
     s = std::move(result);
   }
+}
+
+static void remove_all_gap_columns(std::vector<std::string>& profile) {
+  if (profile.empty()) return;
+
+  std::size_t max_len = 0;
+  for (const auto& row : profile) {
+    max_len = std::max(max_len, row.size());
+  }
+
+  std::vector<std::size_t> keep_cols;
+  keep_cols.reserve(max_len);
+
+  for (std::size_t j = 0; j < max_len; ++j) {
+    bool all_gap = true;
+    for (const auto& row : profile) {
+      char c = (j < row.size()) ? row[j] : '-';
+      if (c != '-') {
+        all_gap = false;
+        break;
+      }
+    }
+    if (!all_gap) keep_cols.push_back(j);
+  }
+
+  for (auto& row : profile) {
+    std::string trimmed;
+    trimmed.reserve(keep_cols.size());
+    for (std::size_t j : keep_cols) {
+      trimmed.push_back((j < row.size()) ? row[j] : '-');
+    }
+    row.swap(trimmed);
+  }
+}
+
+static std::string ungap(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) if (c != '-') out.push_back(c);
+  return out;
+}
+
+std::vector<std::string> restore_full_length_msa(
+    const std::vector<std::string>& originals,
+    const std::vector<std::string>& aligned) {
+
+  // This will store the final MSA sorted in the original input order
+  std::vector<std::string> out(originals.size());
+  std::vector<bool> used_aligned(aligned.size(), false);
+
+  for (size_t i = 0; i < originals.size(); ++i) {
+    bool found = false;
+
+    // Find which aligned sequence corresponds to this original sequence
+    for (size_t j = 0; j < aligned.size(); ++j) {
+      if (used_aligned[j]) continue;
+
+      std::string core = ungap(aligned[j]);
+
+      // Check if this aligned core belongs to the original sequence i
+      size_t pos = originals[i].find(core);
+      if (pos != std::string::npos) {
+        // Re-attach unaligned prefixes and suffixes
+        std::string prefix = originals[i].substr(0, pos);
+        std::string suffix = originals[i].substr(pos + core.size());
+        out[i] = prefix + aligned[j] + suffix;
+
+        used_aligned[j] = true;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      throw std::runtime_error("Aligned core not found in original sequence for row " + std::to_string(i));
+    }
+  }
+
+  normalize_msa_lengths(out);
+  return out;
 }
 
 /**
@@ -1519,7 +1633,7 @@ int computeBandedAlignment(const std::string& x, const std::string& y,
 std::vector<std::string> build_profile_fft(Node* n, ScoreMode mode, ScoreFn fn,
                                            const AlignParams& p) {
   if (!n) return {};
-  if (n->leaf) return {/* raw seq loaded externally ? see wire-up below */};
+  if (n->leaf) return n->profile;   // FIX
 
   auto A = build_profile_fft(n->left, mode, fn, p);
   auto B = build_profile_fft(n->right, mode, fn, p);
@@ -1527,13 +1641,11 @@ std::vector<std::string> build_profile_fft(Node* n, ScoreMode mode, ScoreFn fn,
   std::string consA = generate_consensus(A);
   std::string consB = generate_consensus(B);
 
-  // Get FFT seed offset
   auto [offset, corr] = fftCrossCorrelation(consA, consB, mode);
 
   std::string aligned_consA, aligned_consB;
-  int         bw =
-      std::max(50, checked_size_to_int(std::max(consA.size(), consB.size()) / 4,
-                                       "consensus bandwidth"));
+  int bw = std::max(50, checked_size_to_int(std::max(consA.size(), consB.size()) / 4,
+                                            "consensus bandwidth"));
   computeBandedAlignment(consA, consB, mode, fn, aligned_consA, aligned_consB,
                          p, offset, bw);
 
@@ -1812,66 +1924,70 @@ std::vector<std::string> refine_msa_worker(std::vector<std::string> initial_msa,
                                            int iterations, ScoreMode mode,
                                            ScoreFn fn, std::mt19937& g,
                                            const AlignParams& p) {
-  // A profile with 2 or fewer sequences cannot be split and refined.
-  if (initial_msa.size() <= 2) {
-    return initial_msa;
-  }
+  if (initial_msa.size() <= 2) return initial_msa;
 
-  std::vector<std::string> best_msa = initial_msa;
-  long long best_score              = calculate_sp_score(best_msa, mode, fn, p);
+  std::vector<std::string> best_msa = std::move(initial_msa);
+  normalize_msa_lengths(best_msa);
+  long long best_score = calculate_sp_score(best_msa, mode, fn, p);
 
-  // Create a vector of indices [0, 1, 2, ...] to shuffle for random splitting.
-  std::vector<int> indices(initial_msa.size());
+  std::vector<int> indices(best_msa.size());
   std::iota(indices.begin(), indices.end(), 0);
 
-  // Main refinement loop for this worker
-  for (int i = 0; i < iterations; ++i) {
-    // Shuffle the indices to create a random partition
+  for (int iter = 0; iter < iterations; ++iter) {
     std::shuffle(indices.begin(), indices.end(), g);
 
-    // 1. Split the current best alignment into two random, non-empty profiles
-    // (A and B)
+    const std::size_t split_point = indices.size() / 2;
+    if (split_point == 0 || split_point >= indices.size()) continue;
+
     std::vector<std::string> profileA, profileB;
-    const std::size_t        split_point = initial_msa.size() / 2;
-    for (size_t j = 0; j < initial_msa.size(); ++j) {
-      if (j < split_point) {
-        profileA.push_back(best_msa[indices[j]]);
-      } else {
-        profileB.push_back(best_msa[indices[j]]);
-      }
+    std::vector<int> idxA, idxB;
+    profileA.reserve(split_point);
+    profileB.reserve(indices.size() - split_point);
+    idxA.reserve(split_point);
+    idxB.reserve(indices.size() - split_point);
+
+    for (std::size_t t = 0; t < split_point; ++t) {
+      idxA.push_back(indices[t]);
+      profileA.push_back(best_msa[indices[t]]);
+    }
+    for (std::size_t t = split_point; t < indices.size(); ++t) {
+      idxB.push_back(indices[t]);
+      profileB.push_back(best_msa[indices[t]]);
     }
 
-    // 2. Re-align the two profiles by aligning their consensus sequences
+    remove_all_gap_columns(profileA);
+    remove_all_gap_columns(profileB);
+
+    if (profileA.empty() || profileB.empty()) continue;
+
     std::string repA = generate_consensus(profileA);
     std::string repB = generate_consensus(profileB);
+
+    if (repA.empty() || repB.empty()) continue;
 
     std::string aligned_repA, aligned_repB;
     computeGlobalAlignment(repA, repB, mode, fn, aligned_repA, aligned_repB, p);
 
-    // 3. Project the newly introduced gaps back into the full profiles
     projectGaps(repA, aligned_repA, profileA);
     projectGaps(repB, aligned_repB, profileB);
 
-    // 4. Merge the realigned profiles to create the new candidate MSA
-    std::vector<std::string> new_msa = profileA;
-    new_msa.insert(new_msa.end(), profileB.begin(), profileB.end());
+    std::vector<std::string> new_msa(best_msa.size());
+    for (std::size_t k = 0; k < idxA.size(); ++k) new_msa[idxA[k]] = profileA[k];
+    for (std::size_t k = 0; k < idxB.size(); ++k) new_msa[idxB[k]] = profileB[k];
 
-    // 5. If the new alignment has a better score, adopt it as the new best
+    normalize_msa_lengths(new_msa);
+
     long long new_score = calculate_sp_score(new_msa, mode, fn, p);
     if (new_score > best_score) {
       best_score = new_score;
-      best_msa   = new_msa;
+      best_msa   = std::move(new_msa);
 
-      // This console output is preserved. It will show progress from individual
-      // threads. It's helpful for seeing how active the search is. #pragma omp
-      // critical
-      // {
-      //     std::cout << "  Thread " << omp_get_thread_num()
-      //               << " found a better score: " << best_score << std::endl;
-      // }
+#pragma omp critical
+      std::cout << "Thread " << omp_get_thread_num()
+                << " found a better score: " << best_score << std::endl;
     }
   }
-  // Return the best alignment this specific worker was able to find.
+
   return best_msa;
 }
 
@@ -2045,7 +2161,10 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
 
   // 2. Position calculation and alignment block writing
   const size_t num_sequences    = aln.size();
-  const size_t alignment_length = aln[0].length();
+  size_t alignment_length = 0;
+  for (const auto& row : aln) {
+    alignment_length = std::max(alignment_length, row.size());
+  }
   const int    LINE_WIDTH       = 80;
 
   // Track "current ungapped" position for each sequence, starting from 1
@@ -2086,11 +2205,11 @@ void saveMSA_to_HTML(const std::vector<std::string>& aln,
 
       // Write the colored characters for the current block
       for (size_t j = start_col; j < end_col; ++j) {
-        char current_char       = aln[i][j];
+        char current_char = (j < aln[i].size()) ? aln[i][j] : '-';
         bool is_fully_conserved = (current_char != '-');
         if (is_fully_conserved) {
           for (size_t x = 0; x < num_sequences; ++x) {
-            if (aln[x][j] != current_char) {
+            if (j >= aln[x].size() || aln[x][j] != current_char) {
               is_fully_conserved = false;
               break;
             }
@@ -2816,6 +2935,14 @@ int main(int argc, char** argv) {
   msa = refine_msa(msa, total_rounds, iterations_per_thread_per_round, mode, fn,
                    params);
 
+  normalize_msa_lengths(msa);
+
+  if (msa.size() != hdrs.size()) {
+    std::cerr << "FATAL: final MSA row count (" << msa.size()
+              << ") != header count (" << hdrs.size() << ")\n";
+    return 1;
+  }
+
   // ?? 12) Print and save colored MSA ??????????????????????????????????????
   printColorMSA(msa);
   saveMSA_to_HTML(msa, hdrs, outdir);
@@ -2829,7 +2956,9 @@ int main(int argc, char** argv) {
 
   // ?? 14) Write MSA in FASTA format ???????????????????????????????????????
   std::ofstream mf(outdir + "/msa.fasta");
-  for (int i = 0; i < n; ++i) mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
+  for (size_t i = 0; i < msa.size(); ++i) {
+    mf << ">" << hdrs[i] << "\n" << msa[i] << "\n";
+  }
   mf.close();
 
   return 0;
